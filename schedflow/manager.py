@@ -117,6 +117,9 @@ class SchedFlowManager:
             )
         return self.cached_config
 
+    def override_split_config(self, split_config: SplitConfig) -> None:
+        self.cached_config = split_config
+
     def get_callable(self) -> Callable:
         """Return a synchronous callable that executes the FX graph.
 

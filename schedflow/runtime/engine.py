@@ -105,6 +105,7 @@ class SchedFlowEngine:
         for batch_idx in range(num_nano_batches):
             while node_queue[batch_idx]:
                 node = node_queue[batch_idx][0]
+                node_queue[batch_idx].popleft()
                 if node.op == "placeholder":
                     placeholder_idx = self.placeholder_node_to_idx[node]
                     example_value = node.meta.get("example_value", None)
@@ -171,7 +172,6 @@ class SchedFlowEngine:
                         results[batch_idx] = node.args[0]
                 else:
                     self._execute_non_module(node, batch_idx, args, env, split_config)
-                node_queue[batch_idx].popleft()
             last_events[batch_idx].record()
 
         return {0: results[0]}, last_events
@@ -183,7 +183,7 @@ class SchedFlowEngine:
         op_queue: dict[int, asyncio.Queue[OperatorHandle | None]],
         execute_queue: asyncio.Queue[
             tuple[
-                tuple[OperatorHandle],
+                tuple[OperatorHandle, ...],
                 Callable | None,
                 asyncio.Event,
             ]
@@ -284,7 +284,9 @@ class SchedFlowEngine:
                     )
                 ):
                     exec_results = func(node_args, node_kwargs)
-            elif all(op.module_name == operators[0].module_name for op in operators):
+            elif len(operators) != 1 and all(
+                op.module_name == operators[0].module_name for op in operators
+            ):
                 raise NotImplementedError("Operator batching is not implemented")
                 assert (
                     not split_config.use_cudagraph
@@ -328,26 +330,28 @@ class SchedFlowEngine:
                         else:
                             kwargs[key] = torch.cat(values_combined, dim=0)
                     exec_results.append(module(tuple(args), kwargs))
-            elif len(operators) == 1:
-                op = operators[0]
-                with (
-                    torch.cuda.nvtx.range(f"op_{op.module_name}_{op.nano_batch_idx}"),
-                    set_forward_context(
-                        SchedFlowContext(
-                            nano_batch_idx=(op.nano_batch_idx,),
-                            num_tokens_padded=(
-                                split_config.num_tokens_padded[op.nano_batch_idx],
-                            ),
-                            is_dryrun=split_config.is_dryrun,
-                            use_cudagraph=split_config.use_cudagraph,
-                        )
-                    ),
-                ):
-                    module = getattr(self.graph_module, op.module_name)
-                    # print(f"{op} starting execution")
-                    exec_results.append(module(*node_args[0], **node_kwargs[0]))
-                    # torch.cuda.synchronize()
-                    # print(f"{op} finished execution")
+            else:
+                for idx, op in enumerate(operators):
+                    with (
+                        torch.cuda.nvtx.range(
+                            f"op_{op.module_name}_{op.nano_batch_idx}"
+                        ),
+                        set_forward_context(
+                            SchedFlowContext(
+                                nano_batch_idx=(op.nano_batch_idx,),
+                                num_tokens_padded=(
+                                    split_config.num_tokens_padded[op.nano_batch_idx],
+                                ),
+                                is_dryrun=split_config.is_dryrun,
+                                use_cudagraph=split_config.use_cudagraph,
+                            )
+                        ),
+                    ):
+                        module = getattr(self.graph_module, op.module_name)
+                        # print(f"{op} starting execution")
+                        exec_results.append(module(*node_args[idx], **node_kwargs[idx]))
+                        # torch.cuda.synchronize()
+                        # print(f"{op} finished execution")
 
             for op, result in zip(operators, exec_results):
                 batch_idx = op.nano_batch_idx
