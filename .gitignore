@@ -16,6 +16,7 @@ venv/
 # Test/coverage
 .pytest_cache/
 .coverage*
+.ruff_cache/
 htmlcov/
 
 # Editors
