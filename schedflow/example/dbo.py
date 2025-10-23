@@ -156,16 +156,6 @@ class DBOScheduler(OpSchedulerBase):
                 await context.execute((op,))
             return
 
-        if num_batches != 2:
-            while batch_indices:
-                for batch_idx in list(batch_indices):
-                    op = await context.pop(batch_idx)
-                    if op is None:
-                        batch_indices.remove(batch_idx)
-                    else:
-                        await context.execute((op,))
-            return
-
         warm_up_sequence = [
             ("attention", 0),
             ("attention", 1),
@@ -197,7 +187,8 @@ class DBOScheduler(OpSchedulerBase):
                     current_seq_idx += 1
                     continue
                 if not sequence_keys.intersection(op.tag):
-                    await context.execute((op,))
+                    with torch.cuda.stream(self.comp_stream):
+                        await context.execute((op,))
                     continue
                 if current_seq[current_seq_idx][1] != current_batch_idx:
                     buffered_op[current_batch_idx] = op
