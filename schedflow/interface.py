@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from schedflow.matching import MatchingRule
+
 
 @dataclass
 class InputInfo:
@@ -118,12 +120,12 @@ class OpSchedulerBase(ABC):
         self.policy_name = policy_name
 
     @abstractmethod
-    def get_splitting_ops(self) -> list[str]:
-        """Return fully-qualified op names that should form split boundaries."""
+    def get_split_rules(self) -> list[MatchingRule]:
+        """Return a list of SplitRule describing cut-around intervals."""
         pass
 
     @abstractmethod
-    def get_op_tags(self) -> dict[str, set[str]]:
+    def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
         """Return a mapping from op name to tag set for backend decisions."""
         pass
 

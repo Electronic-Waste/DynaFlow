@@ -1,18 +1,21 @@
 import asyncio
+import os
+import tempfile
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
 from schedflow.config import SchedFlowConfig
+from schedflow.executor.compiler import SubgraphCompiler
 from schedflow.interface import (
     ExecutionContext,
     InputInfo,
     OpSchedulerBase,
     SplitConfig,
 )
+from schedflow.matching import split_graph, tag_graph
 from schedflow.runtime.engine import SchedFlowEngine
-from schedflow.utils import compile_subgraphs
 
 
 class SchedFlowManager:
@@ -60,13 +63,48 @@ class SchedFlowManager:
         """
         self.initialized = True
         self.config = config
-        self.graph_module = compile_subgraphs(
-            graph_module,
-            config=self.config,
-            example_inputs=example_inputs,
-            splitting_ops=scheduler.get_splitting_ops(),
-            op_tags=scheduler.get_op_tags(),
+        # Note: batch-related dimensions (e.g., input_ids length, positions)
+        # must be marked with torch.SymInt in example_inputs so that subgraphs
+        # can discover a symbolic shape argument during tracing/interpretation.
+        self.graph_module = split_graph(graph_module, scheduler.get_split_rules())
+        tag_graph(self.graph_module, scheduler.get_tag_rules())
+        inductor_compile_targets = (
+            [
+                name
+                for name, module in self.graph_module.named_modules()
+                if isinstance(tag := getattr(module, "tag", None), set)
+                and "no-inductor" not in tag
+            ]
+            if config.inductor_config.enabled
+            else []
         )
+        cudagraph_targets = (
+            [
+                name
+                for name, module in self.graph_module.named_modules()
+                if isinstance(tag := getattr(module, "tag", None), set)
+                and "no-cudagraph" not in tag
+            ]
+            if config.cudagraph_config.enabled
+            else []
+        )
+
+        # Persist a human-readable copy of the transformed FX for debugging.
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, "gm_with_subgraphs.py")
+        with open(tmp_path, "w") as f:
+            f.write("# Graph\n")
+            f.write(f"# Inductor Compile Targets: {inductor_compile_targets}\n")
+            f.write(f"# CUDAGraph Targets: {cudagraph_targets}\n")
+            f.write(self.graph_module.print_readable(print_output=False))
+        print(f"Graph saved to {tmp_path}")
+
+        SubgraphCompiler(
+            self.graph_module,
+            config,
+            inductor_compile_targets=inductor_compile_targets,
+            cudagraph_targets=cudagraph_targets,
+        ).run(*example_inputs)
         self.engine = SchedFlowEngine(
             self.graph_module,
             self.config,

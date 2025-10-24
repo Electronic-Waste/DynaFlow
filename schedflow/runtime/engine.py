@@ -5,9 +5,9 @@ from typing import Any
 
 import torch
 
-from schedflow.backend import SubgraphBackend
 from schedflow.config import SchedFlowConfig
 from schedflow.context import SchedFlowContext, set_forward_context
+from schedflow.executor import SubgraphBackend
 from schedflow.interface import OperatorHandle, SplitConfig
 from schedflow.runtime.env import ExecutionEnvironment
 
@@ -272,18 +272,20 @@ class SchedFlowEngine:
             node_kwargs = tuple(node_kwargs)
             exec_results = []
             if func is not None:
+                if len(operators) != 1:
+                    raise NotImplementedError("Operator batching is not implemented")
+                op = operators[0]
                 with set_forward_context(
                     SchedFlowContext(
-                        nano_batch_idx=tuple(op.nano_batch_idx for op in operators),
-                        num_tokens_padded=tuple(
-                            split_config.num_tokens_padded[op.nano_batch_idx]
-                            for op in operators
+                        nano_batch_idx=(op.nano_batch_idx,),
+                        num_tokens_padded=(
+                            split_config.num_tokens_padded[op.nano_batch_idx],
                         ),
                         is_dryrun=split_config.is_dryrun,
                         use_cudagraph=split_config.use_cudagraph,
                     )
                 ):
-                    exec_results = func(node_args, node_kwargs)
+                    exec_results.append(func(*node_args[0], **node_kwargs[0]))
             elif len(operators) != 1 and all(
                 op.module_name == operators[0].module_name for op in operators
             ):

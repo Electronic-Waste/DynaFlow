@@ -18,6 +18,7 @@ from schedflow.interface import (
     OpSchedulerBase,
     SplitConfig,
 )
+from schedflow.matching import MatchingRule, Op
 from schedflow.utils import pack_tokens
 
 
@@ -47,41 +48,34 @@ class DBOScheduler(OpSchedulerBase):
         self.dp_metadata: list[DPMetadata] | None = None
 
     @override
-    def get_splitting_ops(self) -> list[str]:
+    def get_split_rules(self) -> list[MatchingRule]:
         return [
             # NOTE(yi): attention operators should be split
             # when using cudagraph
-            "vllm.unified_attention",
-            "vllm.unified_attention_with_output",
-            "vllm.moe_forward_dispatch",
-            "vllm.moe_forward_expert",
-            "vllm.moe_forward_combine",
-            "vllm.moe_forward_combine_with_shared",
+            MatchingRule(condition=Op(pattern=r"unified_attention.*")),
+            MatchingRule(
+                condition=Op(
+                    pattern=r"moe_forward_(dispatch|expert|combine(?:_with_shared)?)"
+                )
+            ),
         ]
 
     @override
-    def get_op_tags(self) -> dict[str, set[str]]:
+    def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
         return {
-            "vllm.unified_attention": {"attention", "no-cudagraph"},
-            "vllm.unified_attention_with_output": {"attention", "no-cudagraph"},
+            MatchingRule(condition=Op(pattern=r"unified_attention.*")): {
+                "attention",
+                "no-cudagraph",
+            },
             # NOTE(yi): We disable TorchInductor for MoE operators
             # as its input size cannot be determined
-            "vllm.moe_forward_dispatch": {
-                "dispatch",
+            MatchingRule(
+                condition=Op(pattern=r"moe_forward_(dispatch|combine(?:_with_shared)?)")
+            ): {
                 "network",
                 "no-inductor",
             },
-            "vllm.moe_forward_expert": {"expert", "no-inductor"},
-            "vllm.moe_forward_combine": {
-                "combine",
-                "network",
-                "no-inductor",
-            },
-            "vllm.moe_forward_combine_with_shared": {
-                "combine",
-                "network",
-                "no-inductor",
-            },
+            MatchingRule(condition=Op(pattern=r"moe_forward_expert")): {"no-inductor"},
         }
 
     @override

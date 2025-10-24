@@ -14,6 +14,7 @@ from schedflow.interface import (
     OpSchedulerBase,
     SplitConfig,
 )
+from schedflow.matching import MatchingRule, Op
 from schedflow.utils import pack_tokens
 
 
@@ -37,21 +38,22 @@ class NanoFlowScheduler(OpSchedulerBase):
         self.comp_stream = torch.cuda.Stream()
 
     @override
-    def get_splitting_ops(self) -> list[str]:
+    def get_split_rules(self) -> list[MatchingRule]:
         return [
-            "vllm.all_reduce",
+            MatchingRule(condition=Op(pattern=r"all_reduce")),
             # NOTE(yi): attention operators should be split
             # when using cudagraph
-            "vllm.unified_attention",
-            "vllm.unified_attention_with_output",
+            MatchingRule(condition=Op(pattern=r"unified_attention.*")),
         ]
 
     @override
-    def get_op_tags(self) -> dict[str, set[str]]:
+    def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
         return {
-            "vllm.all_reduce": {"network"},
-            "vllm.unified_attention": {"attention", "no-cudagraph"},
-            "vllm.unified_attention_with_output": {"attention", "no-cudagraph"},
+            MatchingRule(condition=Op(pattern=r"all_reduce")): {"network"},
+            MatchingRule(condition=Op(pattern=r"unified_attention.*")): {
+                "attention",
+                "no-cudagraph",
+            },
         }
 
     @override
