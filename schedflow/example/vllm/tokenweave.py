@@ -1,7 +1,10 @@
 import itertools
 from dataclasses import dataclass
+from functools import partial
 
+import flashinfer.comm as flashinfer_comm
 import torch
+from flashinfer import green_ctx
 from typing_extensions import override
 
 # NOTE(yi): the following line is for vLLM only.
@@ -12,6 +15,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from schedflow.interface import (
     ExecutionContext,
     InputInfo,
+    OperatorHandle,
     OpSchedulerBase,
     SplitConfig,
 )
@@ -28,39 +32,72 @@ class TokenWeaveSchedulerConfig:
     cudagraph_capture_sizes: list[int]
 
 
-def fused_ar_add_rms_norm(
-    world_size: int,
-    world_rank: int,
-    x: torch.Tensor,
-    size: int,
-    residual: torch.Tensor,
-    weight: torch.nn.Parameter,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    output = torch.empty_like(x)
-    return torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-        x,
-        residual,
-        weight,
-        1e-5,
-        world_size,
-        world_rank,
-        False,
-        False,
-        True,
-        size,
-        1,
-        False,
-        output,
-    )
-
-
 class TokenWeaveScheduler(OpSchedulerBase):
     def __init__(self, config: TokenWeaveSchedulerConfig) -> None:
         super().__init__("tokenweave")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
-        self.comm_stream = torch.cuda.Stream()
+        self.comm_stream = green_ctx.split_device_green_ctx_by_sm_count(
+            dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[36]
+        )[0][0]
         self.comp_stream = torch.cuda.Stream()
+        self.ipc_handles: list[list[int]] | None = None
+        self.workspace_tensor: torch.Tensor | None = None
+
+    def lazy_initialize_ipc_workspace(self, hidden_dim: int) -> None:
+        if self.ipc_handles is not None:
+            return
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        self.tp_rank, self.tp_size = tp_group.rank_in_group, tp_group.world_size
+        self.ipc_handles, self.workspace_tensor = (
+            flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                max_token_num=16384,
+                hidden_dim=hidden_dim,
+                group=tp_group.device_group,
+                use_fp32_lamport=True,
+            )
+        )
+
+    def fused_ar_add_rms_norm(
+        self,
+        x: torch.Tensor,
+        size: int,
+        residual: torch.Tensor,
+        weight: torch.nn.Parameter,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        residual_out = torch.empty_like(residual)
+        output = torch.empty_like(x)
+        if self.ipc_handles is None:
+            self.lazy_initialize_ipc_workspace(x.shape[-1])
+        assert self.workspace_tensor is not None
+        flashinfer_comm.trtllm_allreduce_fusion(
+            allreduce_in=x,
+            token_num=size,
+            residual_in=residual,
+            residual_out=residual_out,
+            norm_out=output,
+            rms_gamma=weight,
+            rms_eps=1e-5,
+            world_rank=self.tp_rank,
+            world_size=self.tp_size,
+            hidden_dim=x.shape[-1],
+            workspace_ptrs=self.workspace_tensor,
+            launch_with_pdl=False,
+            use_oneshot=True,
+            trigger_completion_at_end=False,
+            fp32_acc=True,
+            pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,  # pyright: ignore[reportArgumentType]
+            allreduce_out=None,
+            quant_out=None,
+            scale_out=None,
+            layout_code=flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4,  # pyright: ignore[reportArgumentType]
+            scale_factor=None,
+        )
+        return output, x
 
     @override
     def get_split_rules(self) -> list[MatchingRule]:
@@ -91,7 +128,6 @@ class TokenWeaveScheduler(OpSchedulerBase):
         input_info: InputInfo,
         use_cudagraph: bool,
     ) -> SplitConfig:
-        assert self.config and self.cudagraph_capture_sizes
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
         mid = min(
             range(len(prefix_sum)),
@@ -143,26 +179,21 @@ class TokenWeaveScheduler(OpSchedulerBase):
         num_batches = context.split_config.num_nano_batches
         batch_indices = list(range(num_batches))
         ctx = get_vllm_forward_context()
-        from vllm.distributed.parallel_state import get_tp_group
-
-        world_size = get_tp_group().world_size
-        world_rank = get_tp_group().rank_in_group
         attn_metadata_list = ctx.attn_metadata
         assert isinstance(attn_metadata_list, list)
 
-        def fused_ar_add_rms_norm_op(x, size, *args):
+        def fused_ar_add_rms_norm_op(
+            output_residual: bool, x: torch.Tensor, size: int, *args
+        ):
             if len(args) == 1:
                 residual = torch.zeros_like(x)
-                return fused_ar_add_rms_norm(
-                    world_size, world_rank, x, size, residual, args[0]
-                )
+                result = self.fused_ar_add_rms_norm(x, size, residual, args[0])
             else:
-                return fused_ar_add_rms_norm(
-                    world_size, world_rank, x, size, args[0], args[1]
-                )
+                result = self.fused_ar_add_rms_norm(x, size, args[0], args[1])
+            return result if output_residual else result[0]
 
         while batch_indices:
-            ops = []
+            ops: list[tuple[int, OperatorHandle]] = []
             for batch_idx in batch_indices:
                 op = await context.pop(batch_idx)
                 if op is None:
@@ -173,6 +204,11 @@ class TokenWeaveScheduler(OpSchedulerBase):
             for batch_idx, op in ops:
                 ctx.attn_metadata = attn_metadata_list[batch_idx]
                 if "ar_add_rms_norm" in op.tag:
-                    await context.execute((op,), fused_ar_add_rms_norm_op)
+                    func = partial(
+                        fused_ar_add_rms_norm_op, op.module_name != "submod_129"
+                    )
+                    with torch.cuda.stream(self.comm_stream):
+                        await context.execute((op,), func)
                 else:
-                    await context.execute((op,))
+                    with torch.cuda.stream(self.comp_stream):
+                        await context.execute((op,))
