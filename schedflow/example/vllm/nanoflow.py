@@ -62,7 +62,6 @@ class NanoFlowScheduler(OpSchedulerBase):
         input_info: InputInfo,
         use_cudagraph: bool,
     ) -> SplitConfig:
-        assert self.config and self.cudagraph_capture_sizes
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
         mid = min(
             range(len(prefix_sum)),
