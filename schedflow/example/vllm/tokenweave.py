@@ -1,8 +1,8 @@
 import itertools
 from dataclasses import dataclass
 from functools import partial
+from typing import Any
 
-import flashinfer.comm as flashinfer_comm
 import torch
 from flashinfer import green_ctx
 from typing_extensions import override
@@ -37,67 +37,65 @@ class TokenWeaveScheduler(OpSchedulerBase):
         super().__init__("tokenweave")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
-        self.comm_stream = green_ctx.split_device_green_ctx_by_sm_count(
-            dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[36]
-        )[0][0]
+        self.comm_stream: torch.cuda.Stream = (
+            green_ctx.split_device_green_ctx_by_sm_count(
+                dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
+            )[0][0]
+        )  # type: ignore
         self.comp_stream = torch.cuda.Stream()
-        self.ipc_handles: list[list[int]] | None = None
-        self.workspace_tensor: torch.Tensor | None = None
+        self.symm_mem_hdl: Any | None = None
 
-    def lazy_initialize_ipc_workspace(self, hidden_dim: int) -> None:
-        if self.ipc_handles is not None:
+    def fused_ar_add_rms_norm(
+        self,
+        output_residual: bool,
+        x: torch.Tensor,
+        size: int,
+        *args,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if len(args) == 1:
+            residual = torch.zeros_like(x)
+            weight = args[0]
+        else:
+            residual, weight = args
+        if self.symm_mem_hdl is None:
+            self.lazy_initialize_tokenweave_custom_op(x.shape[-1], x.dtype, x.device)
+        torch.ops._tokenweave_C.fused_rs_ln_ag_cta(
+            x,
+            residual,
+            weight.data,
+            self.symm_mem_hdl.multicast_ptr,
+            self.symm_mem_hdl.signal_pad_ptrs_dev,
+            self.tp_rank,
+            self.tp_size,
+            self.MAX_CTAS,
+            1e-5,
+        )
+        return (x, residual) if output_residual else x
+
+    def lazy_initialize_tokenweave_custom_op(
+        self, hidden_dim: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        if self.symm_mem_hdl is not None:
             return
+        import sys
+
+        # NOTE(yi): temporary hardcode
+        sys.path.append("/root/vllm/custom_ops/build")
+        import _tokenweave_C  # noqa: F401
+        import torch.distributed._symmetric_memory as symm_mem
         from vllm.distributed.parallel_state import get_tp_group
 
         tp_group = get_tp_group()
         self.tp_rank, self.tp_size = tp_group.rank_in_group, tp_group.world_size
-        self.ipc_handles, self.workspace_tensor = (
-            flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                max_token_num=16384,
-                hidden_dim=hidden_dim,
-                group=tp_group.device_group,
-                use_fp32_lamport=True,
-            )
-        )
+        self.MAX_CTAS = 48
 
-    def fused_ar_add_rms_norm(
-        self,
-        x: torch.Tensor,
-        size: int,
-        residual: torch.Tensor,
-        weight: torch.nn.Parameter,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        residual_out = torch.empty_like(residual)
-        output = torch.empty_like(x)
-        if self.ipc_handles is None:
-            self.lazy_initialize_ipc_workspace(x.shape[-1])
-        assert self.workspace_tensor is not None
-        flashinfer_comm.trtllm_allreduce_fusion(
-            allreduce_in=x,
-            token_num=size,
-            residual_in=residual,
-            residual_out=residual_out,
-            norm_out=output,
-            rms_gamma=weight,
-            rms_eps=1e-5,
-            world_rank=self.tp_rank,
-            world_size=self.tp_size,
-            hidden_dim=x.shape[-1],
-            workspace_ptrs=self.workspace_tensor,
-            launch_with_pdl=False,
-            use_oneshot=True,
-            trigger_completion_at_end=False,
-            fp32_acc=True,
-            pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,  # pyright: ignore[reportArgumentType]
-            allreduce_out=None,
-            quant_out=None,
-            scale_out=None,
-            layout_code=flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4,  # pyright: ignore[reportArgumentType]
-            scale_factor=None,
+        self.staging_buffer = symm_mem.empty(
+            (16384, hidden_dim), dtype=dtype, device=device
         )
-        return output, x
+        tp_group = get_tp_group()
+        self.symm_mem_hdl = symm_mem.rendezvous(
+            self.staging_buffer, tp_group.device_group
+        )
 
     @override
     def get_split_rules(self) -> list[MatchingRule]:
@@ -129,6 +127,7 @@ class TokenWeaveScheduler(OpSchedulerBase):
         use_cudagraph: bool,
     ) -> SplitConfig:
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
+        # print(f"total num tokens: {sum(input_info.num_tokens)}")
         mid = min(
             range(len(prefix_sum)),
             key=lambda i: abs(prefix_sum[i] - (prefix_sum[-1] - prefix_sum[i])),
@@ -182,16 +181,6 @@ class TokenWeaveScheduler(OpSchedulerBase):
         attn_metadata_list = ctx.attn_metadata
         assert isinstance(attn_metadata_list, list)
 
-        def fused_ar_add_rms_norm_op(
-            output_residual: bool, x: torch.Tensor, size: int, *args
-        ):
-            if len(args) == 1:
-                residual = torch.zeros_like(x)
-                result = self.fused_ar_add_rms_norm(x, size, residual, args[0])
-            else:
-                result = self.fused_ar_add_rms_norm(x, size, args[0], args[1])
-            return result if output_residual else result[0]
-
         while batch_indices:
             ops: list[tuple[int, OperatorHandle]] = []
             for batch_idx in batch_indices:
@@ -204,8 +193,9 @@ class TokenWeaveScheduler(OpSchedulerBase):
             for batch_idx, op in ops:
                 ctx.attn_metadata = attn_metadata_list[batch_idx]
                 if "ar_add_rms_norm" in op.tag:
+                    # NOTE(yi): temporary hardcode
                     func = partial(
-                        fused_ar_add_rms_norm_op, op.module_name != "submod_129"
+                        self.fused_ar_add_rms_norm, op.module_name != "submod_129"
                     )
                     with torch.cuda.stream(self.comm_stream):
                         await context.execute((op,), func)
