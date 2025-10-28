@@ -59,6 +59,7 @@ class TokenWeaveScheduler(OpSchedulerBase):
             residual, weight = args
         if self.symm_mem_hdl is None:
             self.lazy_initialize_tokenweave_custom_op(x.shape[-1], x.dtype, x.device)
+        assert self.symm_mem_hdl is not None
         torch.ops._tokenweave_C.fused_rs_ln_ag_cta(
             x,
             residual,

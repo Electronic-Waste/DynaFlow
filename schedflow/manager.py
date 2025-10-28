@@ -169,10 +169,15 @@ class SchedFlowManager:
         from vllm.forward_context import get_forward_context
 
         def _forward(*args, **kwargs) -> Any:
-            assert self.cached_config is not None and self.graph_module is not None
+            assert (
+                self.cached_config is not None
+                and self.graph_module is not None
+                and self.config is not None
+            )
             if (
                 not self.cached_config.is_dryrun
-                and self.cached_config.num_nano_batches == 1
+                and sum(self.cached_config.num_tokens_padded)
+                < self.config.min_nano_split_tokens
             ):
                 forward_context = get_forward_context()
                 assert forward_context is not None and isinstance(
