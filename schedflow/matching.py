@@ -1,4 +1,5 @@
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -51,14 +52,15 @@ class Mod:
 @dataclass(frozen=True)
 class MatchingRule:
     condition: Op | Mod | tuple[Op | Mod, ...]
+    hook: Callable[[list[torch.fx.Node], int], bool] | None = None
 
-    def matches(self, node_list: list[torch.fx.Node]) -> int:
+    def matches(self, node_list: list[torch.fx.Node], start_idx: int) -> int:
         condition_list = (
             [self.condition]
             if isinstance(self.condition, (Op | Mod))
             else self.condition
         )
-        node_idx = 0
+        node_idx = start_idx
         condition_idx = 0
         while node_idx < len(node_list) and condition_idx < len(condition_list):
             cond = condition_list[condition_idx]
@@ -73,7 +75,9 @@ class MatchingRule:
                 node_idx += matched_idx
             condition_idx += 1
 
-        return node_idx
+        if node_idx - start_idx > 0 and self.hook is not None and not self.hook(node_list, start_idx):
+            return 0
+        return node_idx - start_idx
 
 
 def split_graph(
@@ -89,12 +93,12 @@ def split_graph(
     while node_idx < len(nodes):
         matched = False
         for rule in split_rules:
-            matched_idx = rule.matches(nodes[node_idx:])
-            if matched_idx > 0:
+            matched_length = rule.matches(nodes, node_idx)
+            if matched_length > 0:
                 subgraph_id += 1
-                for i in range(node_idx, node_idx + matched_idx):
+                for i in range(node_idx, node_idx + matched_length):
                     node_to_subgraph_id[nodes[i]] = subgraph_id
-                node_idx += matched_idx
+                node_idx += matched_length
                 subgraph_id += 1
                 matched = True
                 break
@@ -134,7 +138,7 @@ def tag_graph(
         while node_idx < len(node_list):
             matched = False
             for rule, tags in tag_rules.items():
-                matched_idx = rule.matches(node_list[node_idx:])
+                matched_idx = rule.matches(node_list, node_idx)
                 if matched_idx > 0:
                     module.tag.update(tags)
                     node_idx += matched_idx

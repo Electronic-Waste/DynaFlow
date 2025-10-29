@@ -3,11 +3,12 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from schedflow.config import CUDAGraphConfig, InductorConfig, SchedFlowConfig
-from schedflow.example.nanoflow import (
+from schedflow.example.hf.nanoflow import (
     NanoFlowScheduler,
     NanoFlowSchedulerConfig,
 )
@@ -50,6 +51,7 @@ def schedflow_backend(
     )
     schedflow_cfg = SchedFlowConfig(
         max_num_nano_batches=2,
+        min_nano_split_tokens=1,
         inductor_config=inductor_cfg,
         cudagraph_config=cudagraph_cfg,
     )
@@ -63,6 +65,9 @@ def schedflow_backend(
     )
     return _manager.get_callable()
 
+def _sync_if_needed():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -71,9 +76,17 @@ def main():
             "into subgraphs using SchedFlow utilities."
         )
     )
-    parser.add_argument("--model", type=str, default="/data/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["hf", "schedflow"],
+        default="schedflow",
+        help="Run plain HuggingFace model ('hf') or with SchedFlow backend ('schedflow').",
+    )
 
     args = parser.parse_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -107,12 +120,19 @@ def main():
     inputs = {"input_ids": input_ids.to(device)}
     example_inputs = {"input_ids": input_ids[0].unsqueeze(0).to(device)}
 
-    compiled_model = torch.compile(
-        model, backend=schedflow_backend, fullgraph=True
-    )
 
+    print(f"Running in {args.mode} mode")
+    
+    if args.mode == "schedflow":
+        compiled_model = torch.compile(
+            model, backend=schedflow_backend, fullgraph=True
+        )
+    else:
+        compiled_model = torch.compile(
+            model, fullgraph=True
+        )
 
-    _manager.override_split_config(SplitConfig(
+    split_config = SplitConfig(
         num_nano_batches=2,
         batch_sizes=[args.batch_size // 2, args.batch_size // 2],
         batch_indices=[0, args.batch_size // 2, args.batch_size],
@@ -121,17 +141,56 @@ def main():
         split_indices=[0, args.batch_size // 2, args.batch_size],
         is_dryrun=False,
         use_cudagraph=False,
-    ))
+    )
+    _manager.override_split_config(split_config)
 
+    
+    warmup_steps = 10
     with torch.inference_mode():
         compiled_model(**example_inputs)
-        outputs = compiled_model(**inputs)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        print(f"[Run] logits shape: {tuple(logits.shape)}")
+        for _ in range(warmup_steps):
+            start_time = time.perf_counter()
+            outputs = compiled_model(**inputs)
+            _manager.override_split_config(split_config)
+            end_time = time.perf_counter()
+            elapsed_ms = (end_time - start_time) * 1000.0
+            print(f"[Warmup] latency: {elapsed_ms:.2f} ms")
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            print(f"[Warmup] logits shape: {tuple(logits.shape)}")
+        print("Warmup completed")
+    
+    latency_list = []
+    with torch.inference_mode():
+        for t in range(args.trials):
+            start = time.perf_counter()
+            outputs = compiled_model(**inputs)
+            _manager.override_split_config(split_config)
+            end = time.perf_counter()
+            elapsed_ms = (end - start) * 1000.0
+            latency_list.append(elapsed_ms)
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            print(f"[Trial {t+1}/{args.trials}] latency: {elapsed_ms:.2f} ms")
+            print(f"[Trial {t+1}/{args.trials}] logits shape: {tuple(logits.shape)}")
 
-    print(
-        "[OK] Executed with SchedFlow backend under torch.compile (fullgraph)"
-    )
+    avg = torch.mean(torch.tensor(latency_list))
+    std = torch.std(torch.tensor(latency_list), unbiased=False)  # population std (divide by N)
+    print(f"[Summary] trials={args.trials}, avg={avg:.2f} ms, std={std:.2f} ms")
+
+    print("Execution completed")
+    
+
+    # with torch.inference_mode():
+    #     compiled_model(**example_inputs)
+    #     start_time = time.perf_counter()
+    #     outputs = compiled_model(**inputs)
+    #     end_time = time.perf_counter()
+    #     elapsed_ms = (end_time - start_time) * 1000.0
+    #     print(f"[Run] latency: {elapsed_ms:.2f} ms")
+    #     logits = outputs.logits if hasattr(outputs, "logits") else outputs
+    #     print(f"[Run] logits shape: {tuple(logits.shape)}")
 
 
 if __name__ == "__main__":
