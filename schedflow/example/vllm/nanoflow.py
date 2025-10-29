@@ -17,6 +17,7 @@ from schedflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
+    OpSchedulerConfigBase,
     SplitConfig,
 )
 from schedflow.matching import MatchingRule, Mod, Op
@@ -24,7 +25,7 @@ from schedflow.utils import pack_tokens
 
 
 @dataclass
-class NanoFlowSchedulerConfig:
+class NanoFlowSchedulerConfig(OpSchedulerConfigBase):
     """Configuration options for the NanoFlow example scheduler."""
 
     min_nano_split_tokens: int
@@ -32,18 +33,22 @@ class NanoFlowSchedulerConfig:
     use_ar_norm_fusion: bool
     cudagraph_capture_sizes: list[int]
 
+    @classmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
+        return NanoFlowScheduler
+
 
 class NanoFlowScheduler(OpSchedulerBase):
     """Simple scheduler that overlaps network and compute when possible."""
 
     def __init__(self, config: NanoFlowSchedulerConfig) -> None:
-        super().__init__("nanoflow")
+        super().__init__(config, policy_name="nanoflow")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
         self.use_ar_norm_fusion = config.use_ar_norm_fusion
         self.comm_stream: torch.cuda.Stream = (
             green_ctx.split_device_green_ctx_by_sm_count(
-                dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[36]
+                dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
             )[0][0]
         )  # type: ignore
         self.comp_stream = torch.cuda.Stream()
@@ -211,7 +216,7 @@ class NanoFlowScheduler(OpSchedulerBase):
                 if "network" in op.tag:
                     # NOTE(yi): temporary hardcode
                     func = partial(
-                        self.fused_ar_add_rms_norm, op.module_name != "submod_129"
+                        self.fused_ar_add_rms_norm, op.module_name != "submod_321"
                     )
                     with torch.cuda.stream(self.comm_stream):
                         await context.execute(

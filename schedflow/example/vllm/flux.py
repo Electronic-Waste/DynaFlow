@@ -13,6 +13,7 @@ from triton_dist.utils import (
     nvshmem_barrier_all_on_stream,
 )
 from typing_extensions import override
+from vllm.distributed.parallel_state import get_tp_group
 
 # NOTE(yi): the following line is for vLLM only.
 # Change this in other systems
@@ -23,6 +24,7 @@ from schedflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
+    OpSchedulerConfigBase,
     SplitConfig,
 )
 from schedflow.matching import MatchingRule, Op
@@ -30,15 +32,19 @@ from schedflow.utils import pack_tokens
 
 
 @dataclass
-class FluxSchedulerConfig:
+class FluxSchedulerConfig(OpSchedulerConfigBase):
     """Configuration options for the Flux example scheduler."""
 
     cudagraph_capture_sizes: list[int]
 
+    @classmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
+        return FluxScheduler
+
 
 class FluxScheduler(OpSchedulerBase):
     def __init__(self, config: FluxSchedulerConfig) -> None:
-        super().__init__("flux")
+        super().__init__(config, policy_name="flux")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()
@@ -48,8 +54,6 @@ class FluxScheduler(OpSchedulerBase):
     def lazy_initialize_triton_distributed_ctx(
         self, hidden_dim: int, output_dim: int, dtype: torch.dtype
     ) -> None:
-        from vllm.distributed.parallel_state import get_tp_group
-
         tp_group = get_tp_group()
         init_nvshmem_by_torch_process_group(tp_group.device_group)
         world_size = tp_group.world_size

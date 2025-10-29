@@ -1,4 +1,5 @@
 import itertools
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -17,6 +18,7 @@ from schedflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
+    OpSchedulerConfigBase,
     SplitConfig,
 )
 from schedflow.matching import MatchingRule, Mod, Op
@@ -24,17 +26,21 @@ from schedflow.utils import pack_tokens
 
 
 @dataclass
-class TokenWeaveSchedulerConfig:
+class TokenWeaveSchedulerConfig(OpSchedulerConfigBase):
     """Configuration options for the TokenWeave example scheduler."""
 
     min_nano_split_tokens: int
     max_num_nano_batches: int
     cudagraph_capture_sizes: list[int]
 
+    @classmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
+        return TokenWeaveScheduler
+
 
 class TokenWeaveScheduler(OpSchedulerBase):
     def __init__(self, config: TokenWeaveSchedulerConfig) -> None:
-        super().__init__("tokenweave")
+        super().__init__(config)
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
         self.comm_stream: torch.cuda.Stream = (
@@ -81,7 +87,9 @@ class TokenWeaveScheduler(OpSchedulerBase):
         import sys
 
         # NOTE(yi): temporary hardcode
-        sys.path.append("/root/vllm/custom_ops/build")
+        sys.path.append(
+            f"{os.path.dirname(os.path.abspath(__file__))}/tokenweave-kernels/build"
+        )
         import _tokenweave_C  # noqa: F401
         import torch.distributed._symmetric_memory as symm_mem
         from vllm.distributed.parallel_state import get_tp_group

@@ -16,6 +16,7 @@ from schedflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
+    OpSchedulerConfigBase,
     SplitConfig,
 )
 from schedflow.matching import MatchingRule, Op
@@ -23,12 +24,16 @@ from schedflow.utils import pack_tokens
 
 
 @dataclass
-class DBOSchedulerConfig:
+class DBOSchedulerConfig(OpSchedulerConfigBase):
     """Configuration options for the DBO example scheduler."""
 
     min_nano_split_tokens: int
     max_num_nano_batches: int
     cudagraph_capture_sizes: list[int]
+
+    @classmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
+        return DBOScheduler
 
 
 class DBOScheduler(OpSchedulerBase):
@@ -40,7 +45,7 @@ class DBOScheduler(OpSchedulerBase):
     """
 
     def __init__(self, config: DBOSchedulerConfig) -> None:
-        super().__init__("dbo")
+        super().__init__(config, policy_name="dbo")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()

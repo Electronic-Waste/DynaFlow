@@ -116,7 +116,9 @@ class ExecutionContext:
 
 
 class OpSchedulerBase(ABC):
-    def __init__(self, policy_name: str) -> None:
+    def __init__(
+        self, config: "OpSchedulerConfigBase", policy_name: str | None = None
+    ) -> None:
         self.policy_name = policy_name
 
     @abstractmethod
@@ -141,4 +143,11 @@ class OpSchedulerBase(ABC):
     @abstractmethod
     async def schedule(self, context: ExecutionContext) -> None:
         """Drive execution by selecting ready operators and issuing requests."""
+        pass
+
+
+class OpSchedulerConfigBase(ABC):
+    @classmethod
+    @abstractmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
         pass

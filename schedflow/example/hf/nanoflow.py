@@ -8,6 +8,7 @@ from schedflow.interface import (
     ExecutionContext,
     InputInfo,
     OpSchedulerBase,
+    OpSchedulerConfigBase,
     SplitConfig,
 )
 from schedflow.matching import MatchingRule, Op
@@ -15,19 +16,23 @@ from schedflow.utils import pack_tokens
 
 
 @dataclass
-class NanoFlowSchedulerConfig:
+class NanoFlowSchedulerConfig(OpSchedulerConfigBase):
     """Configuration options for the NanoFlow example scheduler."""
 
     min_nano_split_tokens: int
     max_num_nano_batches: int
     cudagraph_capture_sizes: list[int]
 
+    @classmethod
+    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
+        return NanoFlowScheduler
+
 
 class NanoFlowScheduler(OpSchedulerBase):
     """Simple scheduler that overlaps network and compute when possible."""
 
     def __init__(self, config: NanoFlowSchedulerConfig) -> None:
-        super().__init__("nanoflow")
+        super().__init__(config, policy_name="nanoflow")
         self.config = config
         self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()
