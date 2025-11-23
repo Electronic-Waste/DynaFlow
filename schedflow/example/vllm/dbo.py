@@ -10,6 +10,8 @@ from vllm.forward_context import DPMetadata
 from vllm.forward_context import (
     get_forward_context as get_vllm_forward_context,
 )
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 
 from schedflow.interface import (
     ExecutionContext,
@@ -19,7 +21,7 @@ from schedflow.interface import (
     OpSchedulerConfigBase,
     SplitConfig,
 )
-from schedflow.matching import MatchingRule, Op
+from schedflow.matching import MatchingRule, Mod, Op
 from schedflow.utils import pack_tokens
 
 
@@ -29,6 +31,7 @@ class DBOSchedulerConfig(OpSchedulerConfigBase):
 
     min_nano_split_tokens: int
     max_num_nano_batches: int
+    use_reduce_norm_fusion: bool
     cudagraph_capture_sizes: list[int]
 
     @classmethod
@@ -55,14 +58,19 @@ class DBOScheduler(OpSchedulerBase):
     @override
     def get_split_rules(self) -> list[MatchingRule]:
         return [
-            # NOTE(yi): attention operators should be split
-            # when using cudagraph
-            MatchingRule(condition=Op(pattern=r"unified_attention.*")),
-            MatchingRule(
-                condition=Op(
-                    pattern=r"moe_forward_(dispatch|expert|combine(?:_with_shared)?)"
+            MatchingRule(condition=Op(pattern=r"moe_forward_(dispatch|expert)")),
+            MatchingRule(condition=Op(pattern=r"moe_forward_combine(?:_with_shared)?"))
+            if not self.config.use_reduce_norm_fusion
+            else MatchingRule(
+                condition=(
+                    Op(pattern=r"moe_forward_combine(?:_with_shared)?"),
+                    Mod(target_cls=DeepseekV2MoE),
+                    Mod(target_cls=RMSNorm),
                 )
             ),
+            # NOTE(yi): attention operators should be split
+            # when using cudagraph
+            # MatchingRule(condition=Op(pattern=r"unified_attention.*")),
         ]
 
     @override
@@ -74,13 +82,24 @@ class DBOScheduler(OpSchedulerBase):
             },
             # NOTE(yi): We disable TorchInductor for MoE operators
             # as its input size cannot be determined
-            MatchingRule(
-                condition=Op(pattern=r"moe_forward_(dispatch|combine(?:_with_shared)?)")
-            ): {
+            MatchingRule(condition=Op(pattern=r"moe_forward_dispatch")): {
                 "network",
                 "no-inductor",
+                "dispatch",
             },
-            MatchingRule(condition=Op(pattern=r"moe_forward_expert")): {"no-inductor"},
+            MatchingRule(condition=Op(pattern=r"moe_forward_expert")): {
+                "no-inductor",
+                "expert",
+            },
+            MatchingRule(condition=Op(pattern=r"moe_forward_combine(?:_with_shared)?"))
+            if not self.config.use_reduce_norm_fusion
+            else MatchingRule(
+                condition=(
+                    Op(pattern=r"moe_forward_combine(?:_with_shared)?"),
+                    Mod(target_cls=DeepseekV2MoE),
+                    Mod(target_cls=RMSNorm),
+                )
+            ): {"network", "no-inductor", "combine"},
         }
 
     @override
@@ -155,8 +174,6 @@ class DBOScheduler(OpSchedulerBase):
             return
 
         warm_up_sequence = [
-            ("attention", 0),
-            ("attention", 1),
             ("attention", 0),
         ]
         sequence = [

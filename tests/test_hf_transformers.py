@@ -3,7 +3,6 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -65,9 +64,11 @@ def schedflow_backend(
     )
     return _manager.get_callable()
 
+
 def _sync_if_needed():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -76,7 +77,9 @@ def main():
             "into subgraphs using SchedFlow utilities."
         )
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument(
+        "--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct"
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--trials", type=int, default=10)
@@ -98,9 +101,7 @@ def main():
             dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
 
-    device = torch.device(
-        f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
@@ -114,23 +115,16 @@ def main():
 
     seq_len = max(args.seq_len, 2)
     token_id = tokenizer.eos_token_id or 1
-    input_ids = torch.full(
-        (args.batch_size, seq_len), token_id, dtype=torch.long
-    )
+    input_ids = torch.full((args.batch_size, seq_len), token_id, dtype=torch.long)
     inputs = {"input_ids": input_ids.to(device)}
     example_inputs = {"input_ids": input_ids[0].unsqueeze(0).to(device)}
 
-
     print(f"Running in {args.mode} mode")
-    
+
     if args.mode == "schedflow":
-        compiled_model = torch.compile(
-            model, backend=schedflow_backend, fullgraph=True
-        )
+        compiled_model = torch.compile(model, backend=schedflow_backend, fullgraph=True)
     else:
-        compiled_model = torch.compile(
-            model, fullgraph=True
-        )
+        compiled_model = torch.compile(model, fullgraph=True)
 
     split_config = SplitConfig(
         num_nano_batches=2,
@@ -144,29 +138,34 @@ def main():
     )
     _manager.override_split_config(split_config)
 
-    
     warmup_steps = 10
     with torch.inference_mode():
         compiled_model(**example_inputs)
         for _ in range(warmup_steps):
-            start_time = time.perf_counter()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             outputs = compiled_model(**inputs)
             _manager.override_split_config(split_config)
-            end_time = time.perf_counter()
-            elapsed_ms = (end_time - start_time) * 1000.0
+            end_event.record()
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
             print(f"[Warmup] latency: {elapsed_ms:.2f} ms")
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
             print(f"[Warmup] logits shape: {tuple(logits.shape)}")
         print("Warmup completed")
-    
+
     latency_list = []
     with torch.inference_mode():
         for t in range(args.trials):
-            start = time.perf_counter()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             outputs = compiled_model(**inputs)
             _manager.override_split_config(split_config)
-            end = time.perf_counter()
-            elapsed_ms = (end - start) * 1000.0
+            end_event.record()
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
             latency_list.append(elapsed_ms)
             if hasattr(outputs, "logits"):
                 logits = outputs.logits
@@ -176,11 +175,12 @@ def main():
             print(f"[Trial {t+1}/{args.trials}] logits shape: {tuple(logits.shape)}")
 
     avg = torch.mean(torch.tensor(latency_list))
-    std = torch.std(torch.tensor(latency_list), unbiased=False)  # population std (divide by N)
+    std = torch.std(
+        torch.tensor(latency_list), unbiased=False
+    )  # population std (divide by N)
     print(f"[Summary] trials={args.trials}, avg={avg:.2f} ms, std={std:.2f} ms")
 
     print("Execution completed")
-    
 
     # with torch.inference_mode():
     #     compiled_model(**example_inputs)

@@ -64,6 +64,12 @@ class MatchingRule:
         condition_idx = 0
         while node_idx < len(node_list) and condition_idx < len(condition_list):
             cond = condition_list[condition_idx]
+            if (
+                node_list[node_idx].op == "call_function"
+                and getattr(node_list[node_idx].target, "__name__", None) == "getitem"
+            ):
+                node_idx += 1
+                continue
             if isinstance(cond, Op):
                 if not cond.matches(node_list[node_idx]):
                     return 0
@@ -75,7 +81,11 @@ class MatchingRule:
                 node_idx += matched_idx
             condition_idx += 1
 
-        if node_idx - start_idx > 0 and self.hook is not None and not self.hook(node_list, start_idx):
+        if (
+            node_idx - start_idx > 0
+            and self.hook is not None
+            and not self.hook(node_list, start_idx)
+        ):
             return 0
         return node_idx - start_idx
 
