@@ -4,28 +4,28 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 
-from schedflow.config import CUDAGraphConfig, InductorConfig, SchedFlowConfig
-from schedflow.example.hf.nanoflow import (
+from dynaflow.config import CUDAGraphConfig, DynaFlowConfig, InductorConfig
+from dynaflow.example.hf.nanoflow import (
     NanoFlowScheduler,
     NanoFlowSchedulerConfig,
 )
-from schedflow.interface import SplitConfig
-from schedflow.manager import SchedFlowManager
+from dynaflow.interface import SplitConfig
+from dynaflow.manager import DynaFlowManager
 
 _scheduler = None
-_manager = SchedFlowManager()
+_manager = DynaFlowManager()
 
 
-def schedflow_backend(
+def dynaflow_backend(
     gm: torch.fx.GraphModule, example_inputs: tuple[Any, ...]
 ) -> Callable:
-    """Create a torch.compile backend that runs the model via SchedFlow.
+    """Create a torch.compile backend that runs the model via DynaFlow.
 
     This backend assumes fullgraph=True from torch.compile. It constructs a
-    minimal SchedFlow configuration and a NanoFlow scheduler, initializes the
-    SchedFlow manager with the compiled FX graph and example inputs, and
+    minimal DynaFlow configuration and a NanoFlow scheduler, initializes the
+    DynaFlow manager with the compiled FX graph and example inputs, and
     returns the callable that executes with programmable scheduling.
     """
     if not any(isinstance(i, torch.SymInt) for i in example_inputs):
@@ -48,7 +48,7 @@ def schedflow_backend(
         enabled=False,
         capture_sizes=[64, 128, 256],
     )
-    schedflow_cfg = SchedFlowConfig(
+    dynaflow_cfg = DynaFlowConfig(
         max_num_nano_batches=2,
         min_nano_split_tokens=1,
         inductor_config=inductor_cfg,
@@ -58,23 +58,126 @@ def schedflow_backend(
     global _manager
     _manager.initialize(
         graph_module=gm,
-        config=schedflow_cfg,
+        config=dynaflow_cfg,
         scheduler=_scheduler,
         example_inputs=list(example_inputs),
     )
     return _manager.get_callable()
 
 
-def _sync_if_needed():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+def run_inference(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    split_config: SplitConfig | None = None,
+    warmup_steps: int = 10,
+    trials: int = 10,
+) -> tuple[float, float]:
+    if split_config is not None:
+        torch._dynamo.mark_dynamic(inputs["input_ids"], 0)
+        compiled_model = torch.compile(model, backend=dynaflow_backend, fullgraph=True)
+        _manager.override_split_config(split_config)
+    else:
+        compiled_model = torch.compile(model, fullgraph=True)
+    latency_list: list[float] = []
+    with torch.inference_mode():
+        for _ in range(warmup_steps):
+            if split_config is not None:
+                _manager.override_split_config(split_config)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            compiled_model(**inputs)
+            end_event.record()
+            end_event.synchronize()
+            latency = start_event.elapsed_time(end_event)
+            print(f"Warmup latency: {latency:.2f} ms")
+
+        for _ in range(trials):
+            if split_config is not None:
+                _manager.override_split_config(split_config)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            outputs = compiled_model(**inputs)
+            end_event.record()
+            end_event.synchronize()
+            latency = start_event.elapsed_time(end_event)
+            print(
+                f"Latency: {latency:.2f} ms; outputs shape: {outputs.logits.shape if hasattr(outputs, 'logits') else outputs.shape}"
+            )
+            latency_list.append(latency)
+
+    avg = float(torch.mean(torch.tensor(latency_list)).item())
+    std = float(torch.std(torch.tensor(latency_list), unbiased=False).item())
+    return avg, std
+
+
+def run_training(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    split_config: SplitConfig | None = None,
+    warmup_steps: int = 10,
+    trials: int = 10,
+) -> tuple[float, float]:
+    def backward_func(loss: torch.Tensor):
+        return loss.backward()
+    if split_config is not None:
+        torch._dynamo.mark_dynamic(inputs["input_ids"], 0)
+        # torch._dynamo.config.compiled_autograd = True
+        torch._dynamo.config.recompile_limit = 1000
+        compiled_model = torch.compile(model, backend=dynaflow_backend, fullgraph=True)
+        # compiled_backward = torch.compile(backward_func, backend=dynaflow_backend)
+        _manager.override_split_config(split_config)
+    else:
+        compiled_model = torch.compile(model, fullgraph=True)
+        # compiled_backward = torch.compile(backward_func, fullgraph=True)
+    compiled_backward = backward_func
+    latency_list: list[float] = []
+    for _ in range(warmup_steps):
+        if split_config is not None:
+            _manager.override_split_config(split_config)
+        outputs = compiled_model(**inputs)
+        loss = outputs.logits.mean()
+        compiled_backward(loss)
+        model.zero_grad()
+    for _ in range(trials):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        if split_config is not None:
+            _manager.override_split_config(split_config)
+        outputs = compiled_model(**inputs)
+        loss = outputs.logits.mean()
+        compiled_backward(loss)
+        model.zero_grad()
+        end_event.record()
+        end_event.synchronize()
+        latency = start_event.elapsed_time(end_event)
+        print(f"Latency: {latency:.2f} ms")
+        latency_list.append(latency)
+    avg = float(torch.mean(torch.tensor(latency_list)).item())
+    std = float(torch.std(torch.tensor(latency_list), unbiased=False).item())
+    return avg, std
+
+
+def run_fwd_bwd_test(model: torch.nn.Module, inputs: dict[str, torch.Tensor]):
+    torch._dynamo.config.compiled_autograd = True
+    torch._dynamo.config.recompile_limit = 1000
+    def forward_backward_func(model: torch.nn.Module, inputs: dict[str, torch.Tensor]):
+        outputs = model(**inputs)
+        loss = outputs.logits.mean()
+        print(loss)
+        loss.backward()
+        return outputs
+    compiled_forward_backward = torch.compile(forward_backward_func, backend=dynaflow_backend)
+    compiled_forward_backward(model, inputs)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Trace an FX graph for a Hugging Face CausalLM model and split it "
-            "into subgraphs using SchedFlow utilities."
+            "into subgraphs using DynaFlow utilities."
         )
     )
     parser.add_argument(
@@ -86,9 +189,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["hf", "schedflow"],
-        default="schedflow",
-        help="Run plain HuggingFace model ('hf') or with SchedFlow backend ('schedflow').",
+        choices=["hf", "dynaflow"],
+        default="dynaflow",
+        help="Run plain HuggingFace model ('hf') or with DynaFlow backend ('dynaflow').",
     )
 
     args = parser.parse_args()
@@ -112,86 +215,37 @@ def main():
         torch_dtype=torch.bfloat16,
         tp_plan="auto",
     ).eval()
+    # model.to(device)
 
     seq_len = max(args.seq_len, 2)
     token_id = tokenizer.eos_token_id or 1
     input_ids = torch.full((args.batch_size, seq_len), token_id, dtype=torch.long)
     inputs = {"input_ids": input_ids.to(device)}
-    example_inputs = {"input_ids": input_ids[0].unsqueeze(0).to(device)}
 
     print(f"Running in {args.mode} mode")
 
-    if args.mode == "schedflow":
-        compiled_model = torch.compile(model, backend=schedflow_backend, fullgraph=True)
+    if args.mode == "dynaflow":
+        split_config = SplitConfig(
+            num_nano_batches=2,
+            batch_sizes=[args.batch_size // 2, args.batch_size // 2],
+            batch_indices=[0, args.batch_size // 2, args.batch_size],
+            num_tokens=[args.batch_size // 2, args.batch_size // 2],
+            num_tokens_padded=[args.batch_size // 2, args.batch_size // 2],
+            split_indices=[0, args.batch_size // 2, args.batch_size],
+            is_dryrun=False,
+            use_cudagraph=False,
+        )
     else:
-        compiled_model = torch.compile(model, fullgraph=True)
+        split_config = None
 
-    split_config = SplitConfig(
-        num_nano_batches=2,
-        batch_sizes=[args.batch_size // 2, args.batch_size // 2],
-        batch_indices=[0, args.batch_size // 2, args.batch_size],
-        num_tokens=[args.batch_size // 2, args.batch_size // 2],
-        num_tokens_padded=[args.batch_size // 2, args.batch_size // 2],
-        split_indices=[0, args.batch_size // 2, args.batch_size],
-        is_dryrun=False,
-        use_cudagraph=False,
+    # avg, std = run_inference(
+    #   model, inputs, split_config, warmup_steps=10, trials=10
+    # )
+    avg, std = run_training(
+        model, inputs, split_config, warmup_steps=10, trials=10
     )
-    _manager.override_split_config(split_config)
-
-    warmup_steps = 10
-    with torch.inference_mode():
-        compiled_model(**example_inputs)
-        for _ in range(warmup_steps):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            outputs = compiled_model(**inputs)
-            _manager.override_split_config(split_config)
-            end_event.record()
-            end_event.synchronize()
-            elapsed_ms = start_event.elapsed_time(end_event)
-            print(f"[Warmup] latency: {elapsed_ms:.2f} ms")
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            print(f"[Warmup] logits shape: {tuple(logits.shape)}")
-        print("Warmup completed")
-
-    latency_list = []
-    with torch.inference_mode():
-        for t in range(args.trials):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            outputs = compiled_model(**inputs)
-            _manager.override_split_config(split_config)
-            end_event.record()
-            end_event.synchronize()
-            elapsed_ms = start_event.elapsed_time(end_event)
-            latency_list.append(elapsed_ms)
-            if hasattr(outputs, "logits"):
-                logits = outputs.logits
-            else:
-                logits = outputs
-            print(f"[Trial {t+1}/{args.trials}] latency: {elapsed_ms:.2f} ms")
-            print(f"[Trial {t+1}/{args.trials}] logits shape: {tuple(logits.shape)}")
-
-    avg = torch.mean(torch.tensor(latency_list))
-    std = torch.std(
-        torch.tensor(latency_list), unbiased=False
-    )  # population std (divide by N)
-    print(f"[Summary] trials={args.trials}, avg={avg:.2f} ms, std={std:.2f} ms")
-
-    print("Execution completed")
-
-    # with torch.inference_mode():
-    #     compiled_model(**example_inputs)
-    #     start_time = time.perf_counter()
-    #     outputs = compiled_model(**inputs)
-    #     end_time = time.perf_counter()
-    #     elapsed_ms = (end_time - start_time) * 1000.0
-    #     print(f"[Run] latency: {elapsed_ms:.2f} ms")
-    #     logits = outputs.logits if hasattr(outputs, "logits") else outputs
-    #     print(f"[Run] logits shape: {tuple(logits.shape)}")
-
+    print(f"Average latency: {avg:.2f} ms, Standard deviation: {std:.2f} ms")
+    # run_fwd_bwd_test(model, inputs)
 
 if __name__ == "__main__":
     main()
