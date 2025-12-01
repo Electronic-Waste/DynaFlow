@@ -13,7 +13,7 @@ from vllm.forward_context import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 
-from schedflow.interface import (
+from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
     OperatorHandle,
@@ -21,8 +21,8 @@ from schedflow.interface import (
     OpSchedulerConfigBase,
     SplitConfig,
 )
-from schedflow.matching import MatchingRule, Mod, Op
-from schedflow.utils import pack_tokens
+from dynaflow.matching import MatchingRule, Mod, Op
+from dynaflow.utils import pack_tokens
 
 
 @dataclass

@@ -5,14 +5,14 @@ import torch
 import torch.fx as fx
 from typing_extensions import override
 
-from schedflow.config import (
+from dynaflow.config import (
     CUDAGraphConfig,
+    DynaFlowConfig,
     InductorConfig,
-    SchedFlowConfig,
 )
-from schedflow.context import get_forward_context
-from schedflow.executor.cudagraph import CUDAGraphWrapper
-from schedflow.executor.inductor import inductor_compile_fx_adaptor_style
+from dynaflow.context import get_forward_context
+from dynaflow.executor.cudagraph import CUDAGraphWrapper
+from dynaflow.executor.inductor import inductor_compile_fx_adaptor_style
 
 
 class SubgraphBackend:
@@ -88,7 +88,7 @@ class SubgraphCompiler(fx.Interpreter):
     def __init__(
         self,
         module: fx.GraphModule,
-        config: SchedFlowConfig,
+        config: DynaFlowConfig,
         *,
         inductor_compile_targets: list[str],
         cudagraph_targets: list[str],

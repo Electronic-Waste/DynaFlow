@@ -6,6 +6,6 @@ from . import interface as interface
 from . import manager as manager
 
 try:
-    __version__ = _version("schedflow")
+    __version__ = _version("dynaflow")
 except Exception:  # pragma: no cover
     __version__ = "0.0.0"

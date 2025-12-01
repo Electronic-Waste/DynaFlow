@@ -6,21 +6,21 @@ from typing import Any
 
 import torch
 
-from schedflow.config import SchedFlowConfig
-from schedflow.executor.compiler import SubgraphCompiler
-from schedflow.interface import (
+from dynaflow.config import DynaFlowConfig
+from dynaflow.executor.compiler import SubgraphCompiler
+from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
     OpSchedulerBase,
     SplitConfig,
 )
-from schedflow.matching import split_graph, tag_graph
-from schedflow.runtime.engine import SchedFlowEngine
+from dynaflow.matching import split_graph, tag_graph
+from dynaflow.runtime.engine import DynaFlowEngine
 
 
-class SchedFlowManager:
+class DynaFlowManager:
     """
-    SchedFlow integration manager.
+    DynaFlow integration manager.
 
     Extracts modules from FX graph and executes them with user-defined
     (programmable) scheduling.
@@ -28,20 +28,20 @@ class SchedFlowManager:
 
     def __init__(self) -> None:
         self.initialized = False
-        self.config: SchedFlowConfig | None = None
+        self.config: DynaFlowConfig | None = None
         self.graph_module: torch.fx.GraphModule | None = None
         self.cached_config: SplitConfig | None = None
         self.scheduler: OpSchedulerBase | None = None
-        self.engine: SchedFlowEngine | None = None
+        self.engine: DynaFlowEngine | None = None
 
     def initialize(
         self,
         graph_module: torch.fx.GraphModule,
-        config: SchedFlowConfig,
+        config: DynaFlowConfig,
         scheduler: OpSchedulerBase,
         example_inputs: list[Any],
     ) -> None:
-        """Initialize SchedFlow with a traced FX graph and a scheduler.
+        """Initialize DynaFlow with a traced FX graph and a scheduler.
 
         This performs the following steps:
         - Partition the input FX graph into schedulable subgraphs using the
@@ -57,7 +57,7 @@ class SchedFlowManager:
 
         Args:
             graph_module: A traced full-graph `torch.fx.GraphModule` to run.
-            config: Global SchedFlow configuration toggles.
+            config: Global DynaFlow configuration toggles.
             scheduler: A user-provided policy implementing `OpSchedulerBase`.
             example_inputs: Example inputs used to compile/capture subgraphs.
         """
@@ -105,7 +105,7 @@ class SchedFlowManager:
             inductor_compile_targets=inductor_compile_targets,
             cudagraph_targets=cudagraph_targets,
         ).run(*example_inputs)
-        self.engine = SchedFlowEngine(
+        self.engine = DynaFlowEngine(
             self.graph_module,
             self.config,
         )
@@ -166,7 +166,7 @@ class SchedFlowManager:
         regular, synchronous forward API.
         """
         assert self.initialized
-        from vllm.forward_context import get_forward_context
+        # from vllm.forward_context import get_forward_context
 
         def _forward(*args, **kwargs) -> Any:
             assert (
@@ -254,8 +254,8 @@ class SchedFlowManager:
             for i in range(num_elements):
                 elements = [results_dict[idx][i] for idx in range(num_nano_batches)]
                 assert all(
-                    isinstance(e, type(elements[0])) for e in elements
-                ), f"Elements have different types: {elements}"
+                    isinstance(e, torch.Tensor) for e in elements
+                ), f"Elements are not tensors: {elements}"
                 # Concatenate each tuple field across nano-batches
                 concatenated.append(torch.cat(elements, dim=0))
             return tuple(concatenated)

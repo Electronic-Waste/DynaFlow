@@ -21,7 +21,7 @@ class InductorConfig:
 
 
 @dataclass
-class SchedFlowConfig:
+class DynaFlowConfig:
     max_num_nano_batches: int
     min_nano_split_tokens: int
     inductor_config: InductorConfig

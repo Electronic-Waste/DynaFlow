@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class SchedFlowContext:
+class DynaFlowContext:
     """Per-call execution context visible to backends and schedulers.
 
     For CUDA Graph capture and replay, and for policy decisions that depend on
@@ -21,10 +21,10 @@ class SchedFlowContext:
     """Whether to use CUDA graph."""
 
 
-_forward_context: SchedFlowContext | None = None
+_forward_context: DynaFlowContext | None = None
 
 
-def get_forward_context() -> SchedFlowContext:
+def get_forward_context() -> DynaFlowContext:
     """Return the current forward execution context.
 
     Must be used inside regions established by `set_forward_context`.
@@ -35,7 +35,7 @@ def get_forward_context() -> SchedFlowContext:
 
 @contextmanager
 def set_forward_context(
-    context: SchedFlowContext,
+    context: DynaFlowContext,
 ) -> Generator[None, None, None]:
     """Install a forward context for the dynamic extent of the with-block."""
     global _forward_context

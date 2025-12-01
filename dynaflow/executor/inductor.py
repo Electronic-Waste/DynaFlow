@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from schedflow.config import InductorConfig
+from dynaflow.config import InductorConfig
 
 
 class AlwaysHitShapeEnv:

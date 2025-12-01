@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from schedflow.matching import MatchingRule
+from dynaflow.matching import MatchingRule
 
 
 @dataclass

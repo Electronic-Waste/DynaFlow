@@ -5,14 +5,14 @@ from typing import Any
 
 import torch
 
-from schedflow.config import SchedFlowConfig
-from schedflow.context import SchedFlowContext, set_forward_context
-from schedflow.executor import SubgraphBackend
-from schedflow.interface import OperatorHandle, SplitConfig
-from schedflow.runtime.env import ExecutionEnvironment
+from dynaflow.config import DynaFlowConfig
+from dynaflow.context import DynaFlowContext, set_forward_context
+from dynaflow.executor import SubgraphBackend
+from dynaflow.interface import OperatorHandle, SplitConfig
+from dynaflow.runtime.env import ExecutionEnvironment
 
 
-class SchedFlowEngine:
+class DynaFlowEngine:
     """Engine that executes FX graph with programmable operator scheduling.
 
     High-level model:
@@ -30,7 +30,7 @@ class SchedFlowEngine:
       engine and never exposed to the scheduler.
     """
 
-    def __init__(self, graph_module: torch.fx.GraphModule, config: SchedFlowConfig):
+    def __init__(self, graph_module: torch.fx.GraphModule, config: DynaFlowConfig):
         """Construct the engine.
 
         Builds helper indices for placeholders, attributes, and module nodes
@@ -150,7 +150,7 @@ class SchedFlowEngine:
                         for k, v in node.kwargs.items()
                     }
                     with set_forward_context(
-                        SchedFlowContext(
+                        DynaFlowContext(
                             nano_batch_idx=(batch_idx,),
                             num_tokens_padded=(num_tokens,),
                             is_dryrun=split_config.is_dryrun,
@@ -276,7 +276,7 @@ class SchedFlowEngine:
                     raise NotImplementedError("Operator batching is not implemented")
                 op = operators[0]
                 with set_forward_context(
-                    SchedFlowContext(
+                    DynaFlowContext(
                         nano_batch_idx=(op.nano_batch_idx,),
                         num_tokens_padded=(
                             split_config.num_tokens_padded[op.nano_batch_idx],
@@ -301,7 +301,7 @@ class SchedFlowEngine:
                         f"({','.join(str(op.nano_batch_idx) for op in operators)})"
                     ),
                     set_forward_context(
-                        SchedFlowContext(
+                        DynaFlowContext(
                             nano_batch_idx=tuple(op.nano_batch_idx for op in operators),
                             num_tokens_padded=tuple(
                                 split_config.num_tokens_padded[op.nano_batch_idx]
@@ -339,7 +339,7 @@ class SchedFlowEngine:
                             f"op_{op.module_name}_{op.nano_batch_idx}"
                         ),
                         set_forward_context(
-                            SchedFlowContext(
+                            DynaFlowContext(
                                 nano_batch_idx=(op.nano_batch_idx,),
                                 num_tokens_padded=(
                                     split_config.num_tokens_padded[op.nano_batch_idx],

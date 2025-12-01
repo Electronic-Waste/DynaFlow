@@ -3,8 +3,8 @@ from typing import Any
 
 import torch
 
-from schedflow.config import CUDAGraphConfig
-from schedflow.context import get_forward_context
+from dynaflow.config import CUDAGraphConfig
+from dynaflow.context import get_forward_context
 
 
 class CUDAGraphPool:

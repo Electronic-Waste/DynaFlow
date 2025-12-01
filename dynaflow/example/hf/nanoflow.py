@@ -4,15 +4,15 @@ from dataclasses import dataclass
 import torch
 from typing_extensions import override
 
-from schedflow.interface import (
+from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
     OpSchedulerBase,
     OpSchedulerConfigBase,
     SplitConfig,
 )
-from schedflow.matching import MatchingRule, Op
-from schedflow.utils import pack_tokens
+from dynaflow.matching import MatchingRule, Op
+from dynaflow.utils import pack_tokens
 
 
 @dataclass

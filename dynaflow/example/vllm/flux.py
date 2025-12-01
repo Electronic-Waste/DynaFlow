@@ -19,7 +19,7 @@ from vllm.distributed.parallel_state import get_tp_group
 # Change this in other systems
 from vllm.forward_context import get_forward_context as get_vllm_forward_context
 
-from schedflow.interface import (
+from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
     OperatorHandle,
@@ -27,8 +27,8 @@ from schedflow.interface import (
     OpSchedulerConfigBase,
     SplitConfig,
 )
-from schedflow.matching import MatchingRule, Op
-from schedflow.utils import pack_tokens
+from dynaflow.matching import MatchingRule, Op
+from dynaflow.utils import pack_tokens
 
 
 @dataclass
