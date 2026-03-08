@@ -1,7 +1,7 @@
 import itertools
-from dataclasses import dataclass
 from functools import partial
 
+from dynaflow.config import DynaFlowConfig
 import flashinfer.comm as flashinfer_comm
 import torch
 from flashinfer import green_ctx
@@ -17,35 +17,26 @@ from dynaflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
-    OpSchedulerConfigBase,
     SplitConfig,
 )
 from dynaflow.matching import MatchingRule, Mod, Op
 from dynaflow.utils import pack_tokens
 
 
-@dataclass
-class NanoFlowSchedulerConfig(OpSchedulerConfigBase):
-    """Configuration options for the NanoFlow example scheduler."""
-
-    min_nano_split_tokens: int
-    max_num_nano_batches: int
-    use_ar_norm_fusion: bool
-    cudagraph_capture_sizes: list[int]
-
-    @classmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        return NanoFlowScheduler
-
-
 class NanoFlowScheduler(OpSchedulerBase):
     """Simple scheduler that overlaps network and compute when possible."""
 
-    def __init__(self, config: NanoFlowSchedulerConfig) -> None:
-        super().__init__(config, policy_name="nanoflow")
-        self.config = config
-        self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
-        self.use_ar_norm_fusion = config.use_ar_norm_fusion
+    def __init__(
+        self,
+        config: DynaFlowConfig,
+    ) -> None:
+        super().__init__(policy_name="nanoflow")
+        nanoflow_config = config.additional_config
+        self.min_nano_split_tokens = nanoflow_config["min_nano_split_tokens"]
+        self.max_num_nano_batches = config.max_num_splits
+        self.use_ar_norm_fusion = nanoflow_config["use_ar_norm_fusion"]
+        self.cudagraph_capture_sizes = \
+            config.cudagraph_config.capture_sizes
         self.comm_stream: torch.cuda.Stream = (
             green_ctx.split_device_green_ctx_by_sm_count(
                 dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
@@ -54,6 +45,14 @@ class NanoFlowScheduler(OpSchedulerBase):
         self.comp_stream = torch.cuda.Stream()
         self.ipc_handles: list[list[int]] | None = None
         self.workspace_tensor: torch.Tensor | None = None
+
+        def _is_final_norm(node_list: list[torch.fx.Node], start_idx: int) -> bool:
+            for node in node_list:
+                if node.op == "output":
+                    return not isinstance(node.args[0], tuple)
+            return False
+
+        self._is_final_norm = _is_final_norm
 
     @override
     def get_split_rules(self) -> list[MatchingRule]:
@@ -65,17 +64,29 @@ class NanoFlowScheduler(OpSchedulerBase):
             ),
             # NOTE(yi): attention operators should be split
             # when using cudagraph
-            # MatchingRule(condition=Op(pattern=r"unified_attention.*")),
+            MatchingRule(condition=Op(pattern=r"unified_attention.*")),
         ]
 
     @override
     def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
+        if not self.use_ar_norm_fusion:
+            network_rules: dict[MatchingRule, set[str]] = {
+                MatchingRule(condition=Op(pattern=r"all_reduce")): {"network"},
+            }
+        else:
+            ar_norm = (Op(pattern=r"all_reduce"), Mod(target_cls=RMSNorm))
+            network_rules = {
+                MatchingRule(
+                    condition=ar_norm,
+                    hook=lambda nl, si: not self._is_final_norm(nl, si),
+                ): {"network"},
+                MatchingRule(
+                    condition=ar_norm,
+                    hook=self._is_final_norm,
+                ): {"network", "final-norm"},
+            }
         return {
-            MatchingRule(condition=Op(pattern=r"all_reduce"))
-            if not self.use_ar_norm_fusion
-            else MatchingRule(
-                condition=(Op(pattern=r"all_reduce"), Mod(target_cls=RMSNorm))
-            ): {"network"},
+            **network_rules,
             MatchingRule(condition=Op(pattern=r"unified_attention.*")): {
                 "attention",
                 "no-cudagraph",
@@ -95,12 +106,12 @@ class NanoFlowScheduler(OpSchedulerBase):
         )
 
         if (
-            prefix_sum[mid] < self.config.min_nano_split_tokens
-            or (prefix_sum[-1] - prefix_sum[mid]) < self.config.min_nano_split_tokens
+            prefix_sum[mid] < self.min_nano_split_tokens
+            or (prefix_sum[-1] - prefix_sum[mid]) < self.min_nano_split_tokens
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:
-                num_tokens_padded = pack_tokens(
+                num_tokens_padded, use_cudagraph = pack_tokens(
                     prefix_sum[-1], self.cudagraph_capture_sizes
                 )
             return SplitConfig(
@@ -119,10 +130,14 @@ class NanoFlowScheduler(OpSchedulerBase):
                 prefix_sum[-1] - prefix_sum[mid],
             ]
             if use_cudagraph:
-                num_tokens_padded = [
+                cudagraph_pack_results = [
                     pack_tokens(num_tokens, self.cudagraph_capture_sizes)
                     for num_tokens in num_tokens_padded
                 ]
+                if all(use for _, use in cudagraph_pack_results):
+                    num_tokens_padded = [padded for padded, _ in cudagraph_pack_results]
+                else:
+                    use_cudagraph = False
             return SplitConfig(
                 num_nano_batches=2,
                 batch_sizes=[mid, input_info.batch_size - mid],
@@ -214,11 +229,10 @@ class NanoFlowScheduler(OpSchedulerBase):
             for batch_idx, op in ops:
                 ctx.attn_metadata = attn_metadata_list[batch_idx]
                 if "network" in op.tag:
-                    # NOTE(yi): temporary hardcode
                     func = partial(
-                        self.fused_ar_add_rms_norm, op.module_name != "submod_321"
+                        self.fused_ar_add_rms_norm, "final-norm" not in op.tag
                     )
-                    with torch.cuda.stream(self.comm_stream):
+                    with torch.cuda.stream(self.comp_stream):
                         await context.execute(
                             (op,), func if self.use_ar_norm_fusion else None
                         )

@@ -1,5 +1,4 @@
 import itertools
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -24,29 +23,16 @@ from dynaflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
-    OpSchedulerConfigBase,
     SplitConfig,
 )
 from dynaflow.matching import MatchingRule, Op
 from dynaflow.utils import pack_tokens
 
 
-@dataclass
-class FluxSchedulerConfig(OpSchedulerConfigBase):
-    """Configuration options for the Flux example scheduler."""
-
-    cudagraph_capture_sizes: list[int]
-
-    @classmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        return FluxScheduler
-
-
 class FluxScheduler(OpSchedulerBase):
-    def __init__(self, config: FluxSchedulerConfig) -> None:
-        super().__init__(config, policy_name="flux")
-        self.config = config
-        self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
+    def __init__(self, *, cudagraph_capture_sizes: list[int], **kwargs) -> None:
+        super().__init__(policy_name="flux")
+        self.cudagraph_capture_sizes = cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
         self.triton_distributed_ctx: dict[int, Any] = {}

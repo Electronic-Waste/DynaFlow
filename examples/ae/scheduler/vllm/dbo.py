@@ -1,5 +1,4 @@
 import itertools
-from dataclasses import dataclass
 
 import torch
 from typing_extensions import override
@@ -18,25 +17,10 @@ from dynaflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
-    OpSchedulerConfigBase,
     SplitConfig,
 )
 from dynaflow.matching import MatchingRule, Mod, Op
 from dynaflow.utils import pack_tokens
-
-
-@dataclass
-class DBOSchedulerConfig(OpSchedulerConfigBase):
-    """Configuration options for the DBO example scheduler."""
-
-    min_nano_split_tokens: int
-    max_num_nano_batches: int
-    use_reduce_norm_fusion: bool
-    cudagraph_capture_sizes: list[int]
-
-    @classmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        return DBOScheduler
 
 
 class DBOScheduler(OpSchedulerBase):
@@ -47,10 +31,20 @@ class DBOScheduler(OpSchedulerBase):
     dispatch/communication, and expert compute.
     """
 
-    def __init__(self, config: DBOSchedulerConfig) -> None:
-        super().__init__(config, policy_name="dbo")
-        self.config = config
-        self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
+    def __init__(
+        self,
+        *,
+        min_nano_split_tokens: int,
+        max_num_nano_batches: int,
+        use_reduce_norm_fusion: bool,
+        cudagraph_capture_sizes: list[int],
+        **kwargs,
+    ) -> None:
+        super().__init__(policy_name="dbo")
+        self.min_nano_split_tokens = min_nano_split_tokens
+        self.max_num_nano_batches = max_num_nano_batches
+        self.use_reduce_norm_fusion = use_reduce_norm_fusion
+        self.cudagraph_capture_sizes = cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
         self.dp_metadata: list[DPMetadata] | None = None
@@ -60,7 +54,7 @@ class DBOScheduler(OpSchedulerBase):
         return [
             MatchingRule(condition=Op(pattern=r"moe_forward_(dispatch|expert)")),
             MatchingRule(condition=Op(pattern=r"moe_forward_combine(?:_with_shared)?"))
-            if not self.config.use_reduce_norm_fusion
+            if not self.use_reduce_norm_fusion
             else MatchingRule(
                 condition=(
                     Op(pattern=r"moe_forward_combine(?:_with_shared)?"),
@@ -92,7 +86,7 @@ class DBOScheduler(OpSchedulerBase):
                 "expert",
             },
             MatchingRule(condition=Op(pattern=r"moe_forward_combine(?:_with_shared)?"))
-            if not self.config.use_reduce_norm_fusion
+            if not self.use_reduce_norm_fusion
             else MatchingRule(
                 condition=(
                     Op(pattern=r"moe_forward_combine(?:_with_shared)?"),
@@ -116,8 +110,8 @@ class DBOScheduler(OpSchedulerBase):
         )
 
         if (
-            prefix_sum[mid] < self.config.min_nano_split_tokens
-            or (prefix_sum[-1] - prefix_sum[mid]) < self.config.min_nano_split_tokens
+            prefix_sum[mid] < self.min_nano_split_tokens
+            or (prefix_sum[-1] - prefix_sum[mid]) < self.min_nano_split_tokens
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:

@@ -10,7 +10,8 @@ from dynaflow.config import (
     DynaFlowConfig,
     InductorConfig,
 )
-from dynaflow.context import get_forward_context
+from dynaflow.interface import OperatorHandle
+from dynaflow.runtime.env import get_op_handle
 from dynaflow.executor.cudagraph import CUDAGraphWrapper
 from dynaflow.executor.inductor import inductor_compile_fx_adaptor_style
 
@@ -75,7 +76,9 @@ class SubgraphBackend:
             and size in self.inductor_config.compile_sizes
         ):
             if size not in self.callables_per_size:
-                assert get_forward_context().is_dryrun
+                op_handle = get_op_handle()
+                assert isinstance(op_handle, OperatorHandle) and op_handle._is_dryrun, \
+                    "Size-specific compilation requires a dry-run with a single OperatorHandle"
                 self.callables_per_size[size] = self.compile(list(args), size)
             return self.callables_per_size[size](*args, **kwargs)
         assert self.callable_dynamic is not None

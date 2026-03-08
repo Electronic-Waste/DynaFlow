@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -22,7 +22,8 @@ class InductorConfig:
 
 @dataclass
 class DynaFlowConfig:
-    max_num_nano_batches: int
-    min_nano_split_tokens: int
+    scheduler_path: str
+    max_num_splits: int
     inductor_config: InductorConfig
     cudagraph_config: CUDAGraphConfig
+    additional_config: dict = field(default_factory=dict)

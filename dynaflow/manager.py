@@ -166,7 +166,7 @@ class DynaFlowManager:
         regular, synchronous forward API.
         """
         assert self.initialized
-        # from vllm.forward_context import get_forward_context
+        from vllm.forward_context import get_forward_context
 
         def _forward(*args, **kwargs) -> Any:
             assert (
@@ -176,15 +176,17 @@ class DynaFlowManager:
             )
             if (
                 not self.cached_config.is_dryrun
-                and sum(self.cached_config.num_tokens_padded)
-                < self.config.min_nano_split_tokens
+                and self.cached_config.num_nano_batches == 1
             ):
                 forward_context = get_forward_context()
                 assert forward_context is not None and isinstance(
                     forward_context.attn_metadata, list
                 )
                 forward_context.attn_metadata = forward_context.attn_metadata[0]
-                return self.graph_module(*args, **kwargs)
+                assert self.engine is not None
+                result = self.engine.execute_single_batch(self.cached_config, args, kwargs)
+                self.cached_config = None
+                return result
             result = asyncio.run(self._forward_async(args, kwargs))
             self.cached_config = None
             return result

@@ -1,0 +1,843 @@
+diff --git a/vllm/compilation/backends.py b/vllm/compilation/backends.py
+index 17fc727b8..fd2b636b1 100644
+--- a/vllm/compilation/backends.py
++++ b/vllm/compilation/backends.py
+@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
+ 
+ import torch
+ import torch.fx as fx
++from dynaflow.config import CUDAGraphConfig, DynaFlowConfig, InductorConfig
+ from torch._dispatch.python import enable_python_dispatcher
+ 
+ import vllm.envs as envs
+@@ -19,6 +20,7 @@ from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils import is_torch_equal_or_newer, resolve_obj_by_qualname
++from vllm.v1.worker.dynaflow import get_manager
+ 
+ from .compiler_interface import (CompilerInterface, EagerAdaptor,
+                                  InductorAdaptor, InductorStandaloneAdaptor)
+@@ -30,7 +32,7 @@ logger = init_logger(__name__)
+ 
+ 
+ def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
+-    if compilation_config.use_inductor:
++    if False: # DynaFlow is currently incompatible with vLLM's compilation
+         # Use standalone compile only if requested, version is new enough,
+         # and the symbol actually exists in this PyTorch build.
+         if (envs.VLLM_USE_STANDALONE_COMPILE
+@@ -474,6 +476,37 @@ class VllmBackend:
+         inductor_config[PASS_KEY] = self.post_grad_pass_manager
+ 
+     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
++        dynaflow_cfg = self.vllm_config.dynaflow_config
++        if dynaflow_cfg is not None:
++            scheduler_path = dynaflow_cfg.pop("scheduler_path")
++            use_inductor = dynaflow_cfg.pop("use_inductor", False)
++            max_num_splits = dynaflow_cfg.pop("max_num_splits", 2)
++            additional_config = dynaflow_cfg.copy()
++            inductor_config = InductorConfig(
++                enabled=use_inductor,
++                compile_sizes=set([
++                    int(size) for size in
++                    self.compilation_config.compile_sizes or []
++                ]),
++            )
++            cudagraph_config = CUDAGraphConfig(
++                enabled=self.compilation_config.cudagraph_mode ==
++                CUDAGraphMode.PIECEWISE,
++                capture_sizes=self.compilation_config.cudagraph_capture_sizes
++                or [],
++            )
++            dynaflow_config = DynaFlowConfig(
++                scheduler_path=scheduler_path,
++                max_num_splits=max_num_splits,
++                inductor_config=inductor_config,
++                cudagraph_config=cudagraph_config,
++                additional_config=additional_config,
++            )
++            return get_manager(
++                graph,
++                dynaflow_config,
++                example_inputs,
++            ).get_callable()
+ 
+         vllm_config = self.vllm_config
+         if not self.compilation_config.cache_dir:
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+index df6564077..139ce550b 100644
+--- a/vllm/config/__init__.py
++++ b/vllm/config/__init__.py
+@@ -132,6 +132,10 @@ class VllmConfig:
+     You can specify the full compilation config like so:
+     `{"level": 3, "cudagraph_capture_sizes": [1, 2, 4, 8]}`
+     """
++    dynaflow_config: Optional[dict[str, Any]] = None
++    """DynaFlow intra-device parallelism configuration.
++    When not None, DynaFlow is enabled. Keys: scheduler_path (file_path:ClassName),
++    use_inductor, plus strategy-specific settings."""
+     kv_transfer_config: Optional[KVTransferConfig] = None
+     """The configurations for distributed KV cache transfer."""
+     kv_events_config: Optional[KVEventsConfig] = None
+@@ -216,6 +220,14 @@ class VllmConfig:
+             vllm_factors.append(self.compilation_config.compute_hash())
+         else:
+             vllm_factors.append("None")
++        if self.dynaflow_config:
++            dynaflow_config_hash = hashlib.md5(
++                json.dumps(self.dynaflow_config, sort_keys=True).encode(),
++                usedforsecurity=False,
++            ).hexdigest()
++            vllm_factors.append(dynaflow_config_hash)
++        else:
++            vllm_factors.append("None")
+         if self.kv_transfer_config:
+             vllm_factors.append(self.kv_transfer_config.compute_hash())
+         else:
+@@ -329,6 +341,16 @@ class VllmConfig:
+                 "To workaround this limitation, vLLM will set 'ieee' input "
+                 "precision for chunked prefill triton kernels.")
+ 
++        if self.dynaflow_config is not None:
++            if self.model_config.enforce_eager:
++                logger.info("DynaFlow is not supported with "
++                            "enforce_eager. Disabling DynaFlow.")
++                self.dynaflow_config = None
++            elif self.compilation_config.full_cuda_graph:
++                logger.info("full_cuda_graph is not supported with "
++                            "DynaFlow. Disabling DynaFlow.")
++                self.dynaflow_config = None
++
+         # If the user does not explicitly set a compilation level, then
+         # we use the default level. The default level depends on other
+         # settings (see the below code).
+@@ -494,16 +516,6 @@ class VllmConfig:
+                     "when cudagraph_mode piecewise cudagraphs is used, "\
+                     f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
+ 
+-        if self.parallel_config.enable_dbo:
+-            a2a_backend = envs.VLLM_ALL2ALL_BACKEND
+-            assert a2a_backend in \
+-                ["deepep_low_latency", "deepep_high_throughput"], \
+-            "Microbatching currently only supports the deepep_low_latency and "\
+-            f"deepep_high_throughput all2all backend. {a2a_backend} is not "\
+-            "supported. To fix set the VLLM_ALL2ALL_BACKEND environment "\
+-            "variable to deepep_low_latency or deepep_high_throughput and "\
+-            "install the DeepEP kernels."
+-
+         if not self.instance_id:
+             self.instance_id = random_uuid()[:5]
+ 
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 3f0dfce1b..9a1bc140c 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -467,6 +467,9 @@ class EngineArgs:
+     additional_config: dict[str, Any] = \
+         get_field(VllmConfig, "additional_config")
+ 
++    dynaflow_config: Optional[dict[str, Any]] = \
++        get_field(VllmConfig, "dynaflow_config")
++
+     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+     pt_load_map_location: str = LoadConfig.pt_load_map_location
+ 
+@@ -927,6 +930,8 @@ class EngineArgs:
+                                 **vllm_kwargs["compilation_config"])
+         vllm_group.add_argument("--additional-config",
+                                 **vllm_kwargs["additional_config"])
++        vllm_group.add_argument("--dynaflow-config",
++                                **vllm_kwargs["dynaflow_config"])
+         vllm_group.add_argument('--structured-outputs-config',
+                                 **vllm_kwargs["structured_outputs_config"])
+ 
+@@ -1430,6 +1435,7 @@ class EngineArgs:
+             structured_outputs_config=self.structured_outputs_config,
+             observability_config=observability_config,
+             compilation_config=self.compilation_config,
++            dynaflow_config=self.dynaflow_config,
+             kv_transfer_config=self.kv_transfer_config,
+             kv_events_config=self.kv_events_config,
+             additional_config=self.additional_config,
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 89e0cee08..a55324b98 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -932,6 +932,7 @@ class FusedMoE(CustomOp):
+                                                 self.moe_parallel_config)
+ 
+         # For smuggling this layer into the fused moe custom op
++        self.dynaflow_enabled = vllm_config.dynaflow_config is not None
+         compilation_config = vllm_config.compilation_config
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError("Duplicate layer name: {}".format(prefix))
+@@ -1725,9 +1726,25 @@ class FusedMoE(CustomOp):
+                 # will switch to using the moe_forward custom op.
+                 fused_output = self.forward_impl(hidden_states, router_logits)
+                 assert not isinstance(fused_output, tuple)
+-            else:
++            elif not self.dynaflow_enabled:
+                 fused_output = torch.ops.vllm.moe_forward(
+-                    hidden_states, router_logits, self.layer_name)
++                    hidden_states, router_logits, self.layer_name
++                )
++            else:
++                hidden_states, router_logits = \
++                    torch.ops.vllm.moe_forward_dispatch(
++                        hidden_states,
++                        router_logits,
++                        self.layer_name)
++                final_hidden_states = \
++                    torch.ops.vllm.moe_forward_expert(
++                        hidden_states,
++                        router_logits,
++                        self.layer_name)
++                fused_output = \
++                    torch.ops.vllm.moe_forward_combine(
++                        final_hidden_states,
++                        self.layer_name)
+             return fused_output[..., :og_hidden_states]
+         else:
+             if current_platform.is_tpu():
+@@ -1735,11 +1752,34 @@ class FusedMoE(CustomOp):
+                 # will switch to using the moe_forward custom op.
+                 shared_output, fused_output = self.forward_impl(
+                     hidden_states, router_logits)
++            elif not self.dynaflow_enabled:
++                shared_output, fused_output = torch.ops.vllm.moe_forward_with_shared(
++                    hidden_states, router_logits, self.layer_name
++                )
+             else:
+-                shared_output, fused_output = torch.ops.vllm.moe_forward_shared(
+-                    hidden_states, router_logits, self.layer_name)
+-            return (shared_output[..., :og_hidden_states],
+-                    fused_output[..., :og_hidden_states])
++                shared_output = \
++                    torch.ops.vllm.moe_forward_shared(
++                        hidden_states,
++                        self.layer_name)
++                hidden_states, router_logits = \
++                    torch.ops.vllm.moe_forward_dispatch(
++                        hidden_states,
++                        router_logits,
++                        self.layer_name)
++                final_hidden_states = \
++                    torch.ops.vllm.moe_forward_expert(
++                        hidden_states,
++                        router_logits,
++                        self.layer_name)
++                shared_output, fused_output = \
++                    torch.ops.vllm.moe_forward_combine_with_shared(
++                        shared_output,
++                        final_hidden_states,
++                        self.layer_name)
++            return (
++                shared_output[..., :og_hidden_states],
++                fused_output[..., :og_hidden_states],
++            )
+ 
+     def forward_cuda(
+         self,
+@@ -1961,6 +2001,79 @@ class FusedMoE(CustomOp):
+                 reduce_output(final_hidden_states[1]),
+             )
+ 
++    def forward_impl_dispatch(
++            self, hidden_states: torch.Tensor,
++            router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        assert self.quant_method is not None
++        do_naive_dispatch_combine: bool = (
++            self.dp_size > 1
++            and not self.moe_parallel_config.use_deepep_ht_kernels
++            and not self.moe_config.use_flashinfer_cutlass_kernels)
++        if do_naive_dispatch_combine:
++            hidden_states, router_logits = get_ep_group().dispatch(
++                hidden_states, router_logits)
++        return hidden_states, router_logits
++
++    def forward_impl_shared(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        assert self.shared_experts is not None
++        return self.shared_experts(hidden_states)
++
++    def forward_impl_expert(self, hidden_states: torch.Tensor,
++                            router_logits: torch.Tensor) -> torch.Tensor:
++        assert self.quant_method is not None
++        final_hidden_states = self.quant_method.apply(
++            layer=self,
++            x=hidden_states,
++            router_logits=router_logits,
++            top_k=self.top_k,
++            renormalize=self.renormalize,
++            use_grouped_topk=self.use_grouped_topk,
++            global_num_experts=self.global_num_experts,
++            expert_map=self.expert_map,
++            topk_group=self.topk_group,
++            num_expert_group=self.num_expert_group,
++            custom_routing_function=self.custom_routing_function,
++            scoring_func=self.scoring_func,
++            routed_scaling_factor=self.routed_scaling_factor,
++            e_score_correction_bias=self.e_score_correction_bias,
++            activation=self.activation,
++            apply_router_weight_on_input=self.apply_router_weight_on_input,
++            enable_eplb=self.enable_eplb,
++            expert_load_view=self.expert_load_view,
++            logical_to_physical_map=self.logical_to_physical_map,
++            logical_replica_count=self.logical_replica_count,
++        )
++        assert not isinstance(final_hidden_states, tuple)
++        return final_hidden_states
++
++    def forward_impl_combine(
++        self,
++        final_hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        do_naive_dispatch_combine: bool = (
++            self.dp_size > 1
++            and not self.moe_parallel_config.use_deepep_ht_kernels
++            and not self.moe_config.use_flashinfer_cutlass_kernels)
++
++        def reduce_output(states: torch.Tensor,
++                          do_combine: bool = True) -> torch.Tensor:
++            if do_naive_dispatch_combine and do_combine:
++                states = get_ep_group().combine(states)
++
++            if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
++                states = self.maybe_all_reduce_tensor_model_parallel(states)
++
++            return states
++
++        if self.shared_experts is None:
++            assert not isinstance(final_hidden_states, tuple)
++            return reduce_output(final_hidden_states)
++        else:
++            return (
++                reduce_output(final_hidden_states[0], do_combine=False),
++                reduce_output(final_hidden_states[1]),
++            )
++
+     @classmethod
+     def make_expert_params_mapping(
+             cls,
+@@ -2041,34 +2154,130 @@ direct_register_custom_op(
+     tags=(torch.Tag.needs_fixed_stride_order, ),
+ )
+ 
+-
+-def moe_forward_shared(
+-    hidden_states: torch.Tensor,
+-    router_logits: torch.Tensor,
+-    layer_name: str,
+-) -> tuple[torch.Tensor, torch.Tensor]:
++def moe_forward_with_shared(hidden_states: torch.Tensor,
++                            router_logits: torch.Tensor,
++                            layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+     forward_context: ForwardContext = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+     assert self.shared_experts is not None
+     return self.forward_impl(hidden_states, router_logits)
+ 
++def moe_forward_with_shared_fake(hidden_states: torch.Tensor,
++                                 router_logits: torch.Tensor,
++                                 layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
++    return torch.empty_like(hidden_states), torch.empty_like(hidden_states)
+ 
+-def moe_forward_shared_fake(
+-    hidden_states: torch.Tensor,
+-    router_logits: torch.Tensor,
+-    layer_name: str,
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    shared_out = torch.empty_like(hidden_states)
+-    fused_out = torch.empty_like(hidden_states)
+-    return shared_out, fused_out
++direct_register_custom_op(
++    op_name="moe_forward_with_shared",
++    op_func=moe_forward_with_shared,
++    mutates_args=["hidden_states"],
++    fake_impl=moe_forward_with_shared_fake,
++    dispatch_key=current_platform.dispatch_key,
++)
+ 
++def moe_forward_dispatch(hidden_states: torch.Tensor,
++                         router_logits: torch.Tensor,
++                         layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
++    forward_context: ForwardContext = get_forward_context()
++    self = forward_context.no_compile_layers[layer_name]
++    return self.forward_impl_dispatch(hidden_states, router_logits)
++
++
++def moe_forward_dispatch_fake(
++        hidden_states: torch.Tensor, router_logits: torch.Tensor,
++        layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
++    return torch.empty_like(hidden_states), torch.empty_like(router_logits)
++
++
++def moe_forward_shared(hidden_states: torch.Tensor,
++                       layer_name: str) -> torch.Tensor:
++    forward_context: ForwardContext = get_forward_context()
++    self = forward_context.no_compile_layers[layer_name]
++    return self.forward_impl_shared(hidden_states)
++
++
++def moe_forward_shared_fake(hidden_states: torch.Tensor,
++                            layer_name: str) -> torch.Tensor:
++    return torch.empty_like(hidden_states)
++
++
++def moe_forward_expert(hidden_states: torch.Tensor,
++                       router_logits: torch.Tensor,
++                       layer_name: str) -> torch.Tensor:
++    forward_context: ForwardContext = get_forward_context()
++    self = forward_context.no_compile_layers[layer_name]
++    return self.forward_impl_expert(hidden_states, router_logits)
++
++
++def moe_forward_expert_fake(hidden_states: torch.Tensor,
++                            router_logits: torch.Tensor,
++                            layer_name: str) -> torch.Tensor:
++    return torch.empty_like(hidden_states)
++
++
++def moe_forward_combine(final_hidden_states: torch.Tensor,
++                        layer_name: str) -> torch.Tensor:
++    forward_context: ForwardContext = get_forward_context()
++    self = forward_context.no_compile_layers[layer_name]
++    return self.forward_impl_combine(final_hidden_states)
++
++
++def moe_forward_combine_fake(final_hidden_states: torch.Tensor,
++                        layer_name: str) -> torch.Tensor:
++    return torch.empty_like(final_hidden_states)
++
++
++def moe_forward_combine_with_shared(shared_output: torch.Tensor,
++                        final_hidden_states: torch.Tensor,
++                        layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
++    forward_context: ForwardContext = get_forward_context()
++    self = forward_context.no_compile_layers[layer_name]
++    return self.forward_impl_combine((shared_output, final_hidden_states))
++
++
++def moe_forward_combine_with_shared_fake(
++        shared_output: torch.Tensor,
++        final_hidden_states: torch.Tensor,
++        layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
++    return (torch.empty_like(shared_output), torch.empty_like(final_hidden_states))
++
++
++direct_register_custom_op(
++    op_name="moe_forward_dispatch",
++    op_func=moe_forward_dispatch,
++    mutates_args=["hidden_states"],
++    fake_impl=moe_forward_dispatch_fake,
++    dispatch_key=current_platform.dispatch_key,
++    tags=(torch.Tag.needs_fixed_stride_order, ),
++)
+ 
+ direct_register_custom_op(
+     op_name="moe_forward_shared",
+     op_func=moe_forward_shared,
+     mutates_args=["hidden_states"],
+     fake_impl=moe_forward_shared_fake,
+-    tags=(torch.Tag.needs_fixed_stride_order, ),
++    dispatch_key=current_platform.dispatch_key,
++)
++
++direct_register_custom_op(
++    op_name="moe_forward_expert",
++    op_func=moe_forward_expert,
++    mutates_args=["hidden_states"],
++    fake_impl=moe_forward_expert_fake,
++)
++
++direct_register_custom_op(
++    op_name="moe_forward_combine",
++    op_func=moe_forward_combine,
++    mutates_args=["final_hidden_states"],
++    fake_impl=moe_forward_combine_fake,
++)
++
++direct_register_custom_op(
++    op_name="moe_forward_combine_with_shared",
++    op_func=moe_forward_combine_with_shared,
++    mutates_args=["shared_output", "final_hidden_states"],
++    fake_impl=moe_forward_combine_with_shared_fake,
+ )
+ 
+ # Mark the FusedMoE weight_loader as supporting MoE-specific parameters
+diff --git a/vllm/v1/worker/dynaflow.py b/vllm/v1/worker/dynaflow.py
+new file mode 100644
+index 000000000..770113fec
+--- /dev/null
++++ b/vllm/v1/worker/dynaflow.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import importlib.util
++from typing import Any, Optional
++
++import numpy as np
++import torch
++from dynaflow.config import DynaFlowConfig
++from dynaflow.interface import OpSchedulerBase, SplitConfig
++from dynaflow.manager import DynaFlowManager
++
++from vllm.distributed.parallel_state import get_dp_group
++from vllm.forward_context import DPMetadata
++from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
++
++_manager = DynaFlowManager()
++_scheduler: OpSchedulerBase | None = None
++
++
++def get_manager(
++    graph_module: torch.fx.GraphModule,
++    config: DynaFlowConfig,
++    example_inputs: list[Any],
++) -> DynaFlowManager:
++    global _manager, _scheduler
++
++    file_path, cls_name = config.scheduler_path.split(":", 1)
++    spec = importlib.util.spec_from_file_location("_dynaflow_scheduler", file_path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    scheduler_cls = getattr(module, cls_name)
++    _scheduler = scheduler_cls(config)
++    assert _scheduler is not None
++    _manager.initialize(graph_module, config, _scheduler, example_inputs)
++    return _manager
++
++
++def nano_ubatch_split(
++    num_scheduled_tokens_per_request: np.ndarray,
++    num_tokens_unpadded: int,
++    num_tokens_padded: int,
++    is_dummy_run: bool = False,
++    use_cudagraph: bool = False,
++) -> tuple[UBatchSlices, torch.Tensor]:
++    """
++    Prepare two UBatch-compatible nano-batch slices.
++
++    - Uses nano_manager.prepare_nano_split to decide if splitting is beneficial
++      (i.e., num_nano_batches > 1).
++    - Computes a single token split point using custom logic to remain
++      compatible with UBatch execution.
++    """
++    batch_size = int(len(num_scheduled_tokens_per_request))
++    tokens_list = num_scheduled_tokens_per_request.tolist()
++    split_config = _manager.prepare(
++        batch_size,
++        tokens_list,
++        is_dryrun=is_dummy_run,
++        use_cudagraph=use_cudagraph,
++    )
++    dp_group = get_dp_group()
++    dp_size, dp_rank = dp_group.world_size, dp_group.rank
++    if dp_size == 1:
++        dp_metadatas = None
++        total_num_tokens_across_dp = [sum(split_config.num_tokens_padded)]
++    else:
++        dp_nano_split_config: list[Optional[SplitConfig]] = [
++            None for _ in range(dp_size)
++        ]
++        dp_nano_split_config[dp_rank] = split_config
++        disable_nano_split = False
++        for i in range(dp_size):
++            dp_nano_split_config[i] = dp_group.broadcast_object(
++                dp_nano_split_config[i], src=i)
++            remote_config = dp_nano_split_config[i]
++            assert remote_config is not None
++            if remote_config.num_nano_batches == 1:
++                disable_nano_split = True
++        if disable_nano_split:
++            split_config = SplitConfig(
++                num_nano_batches=1,
++                batch_sizes=[batch_size],
++                batch_indices=[0, batch_size],
++                num_tokens=[num_tokens_unpadded],
++                num_tokens_padded=[num_tokens_padded],
++                split_indices=[0, num_tokens_unpadded],
++                is_dryrun=is_dummy_run,
++                use_cudagraph=use_cudagraph,
++            )
++            _manager.override_split_config(split_config)
++            dp_nano_split_config[dp_rank] = split_config
++            for i in range(dp_size):
++                dp_nano_split_config[i] = dp_group.broadcast_object(
++                    dp_nano_split_config[i], src=i)
++            assert all(config is not None and config.num_nano_batches == 1
++                       for config in dp_nano_split_config)
++
++        num_tokens_across_dp = [[
++            config.num_tokens_padded[i] for config in dp_nano_split_config
++            if config is not None
++        ] for i in range(split_config.num_nano_batches)]
++        cu_num_tokens_across_dp = [[
++            sum(tokens[:i + 1]) for i in range(len(tokens))
++        ] for tokens in num_tokens_across_dp]
++        total_num_tokens_across_dp = [
++            sum(tokens[i] for tokens in num_tokens_across_dp)
++            for i in range(dp_size)
++        ]
++        max_tokens_across_dp = [max(tokens) for tokens in num_tokens_across_dp]
++        dp_metadatas = [
++            DPMetadata(
++                max_tokens_across_dp_cpu=torch.tensor(
++                    max_tokens_across_dp[i],
++                    device="cpu",
++                    dtype=torch.int32,
++                ),
++                cu_tokens_across_dp_cpu=torch.tensor(
++                    cu_num_tokens_across_dp[i],
++                    device="cpu",
++                    dtype=torch.int32,
++                ),
++                local_sizes=[
++                    config.num_tokens_padded[i]
++                    for config in dp_nano_split_config if config is not None
++                ],
++            ) for i in range(split_config.num_nano_batches)
++        ]
++
++    if dp_size > 1 and _scheduler is not None:
++        _scheduler.set_dp_metadata(dp_metadatas) # type: ignore
++
++    return (
++        [
++            UBatchSlice(
++                slice(
++                    split_config.batch_indices[i],
++                    split_config.batch_indices[i + 1],
++                ),
++                slice(
++                    split_config.split_indices[i],
++                    split_config.split_indices[i + 1],
++                ),
++            ) for i in range(split_config.num_nano_batches)
++        ],
++        # The padding will be handled by the dynaflow engine.
++        torch.tensor(total_num_tokens_across_dp,
++                     device="cpu",
++                     dtype=torch.int32),
++    )
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index ee339e22c..269cf33e3 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -31,8 +31,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                           has_kv_transfer_group)
+ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+ from vllm.distributed.parallel_state import (
+-    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
+-    prepare_communication_buffer_for_model)
++    get_dp_group, get_pp_group, get_tp_group, graph_capture,
++    is_global_first_rank, prepare_communication_buffer_for_model)
+ from vllm.forward_context import (BatchDescriptor, DPMetadata,
+                                   set_forward_context)
+ from vllm.logger import init_logger
+@@ -91,6 +91,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+ from vllm.v1.structured_output.utils import apply_grammar_bitmask
+ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
++from vllm.v1.worker.dynaflow import nano_ubatch_split
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+ from vllm.v1.worker.kv_connector_model_runner_mixin import (
+@@ -176,6 +177,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         self.model_config = vllm_config.model_config
+         self.cache_config = vllm_config.cache_config
+         self.compilation_config = vllm_config.compilation_config
++        self.dynaflow_enabled = vllm_config.dynaflow_config is not None
+         self.lora_config = vllm_config.lora_config
+         self.load_config = vllm_config.load_config
+         self.parallel_config = vllm_config.parallel_config
+@@ -1032,11 +1034,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+         num_tokens_padded = num_tokens_unpadded + self.get_local_padding(
+             num_tokens_unpadded)
+-        ubatch_slices, num_tokens_after_padding = \
+-            ubatch_split(num_scheduled_tokens,
+-                         num_tokens_unpadded,
+-                         num_tokens_padded,
+-                         self.vllm_config)
++        if self.dynaflow_enabled:
++            ubatch_slices, num_tokens_after_padding = \
++                nano_ubatch_split(
++                    num_scheduled_tokens,
++                    num_tokens_unpadded,
++                    num_tokens_padded,
++                    is_dummy_run=False,
++                    use_cudagraph=(
++                        self.compilation_config.cudagraph_mode == \
++                            CUDAGraphMode.PIECEWISE
++                    )
++                )
++        else:
++            ubatch_slices, num_tokens_after_padding = \
++                ubatch_split(num_scheduled_tokens,
++                            num_tokens_unpadded,
++                            num_tokens_padded,
++                            self.vllm_config)
+ 
+         self.seq_lens.np[:num_reqs] = (
+             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+@@ -1865,23 +1880,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+     def _preprocess(
+         self,
+         scheduler_output: "SchedulerOutput",
++        num_input_tokens: int,
+         intermediate_tensors: Optional[IntermediateTensors] = None,
+-        ubatch_slices: Optional[UBatchSlices] = None,
+-        num_tokens_after_padding: Optional[torch.Tensor] = None,
+-    ) -> tuple[int, int, Optional[torch.Tensor], Optional[torch.Tensor],
+-               Optional[torch.Tensor], torch.Tensor,
+-               Optional[IntermediateTensors], dict[str, Any]]:
+-
++    ) -> tuple[int, Optional[torch.Tensor], Optional[torch.Tensor],
++               torch.Tensor, Optional[IntermediateTensors], dict[str, Any]]:
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+-        if ubatch_slices:
+-            assert num_tokens_after_padding is not None
+-            num_input_tokens = int(num_tokens_after_padding[0].item() * 2)
+-            self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
+-        elif ubatch_slices is None:
+-            num_input_tokens = self._get_num_input_tokens(num_scheduled_tokens)
+-            num_pad, num_tokens_after_padding = self.get_dp_padding(
+-                num_input_tokens)
+-            num_input_tokens += num_pad
+ 
+         # _prepare_inputs may reorder the batch, so we must gather multi
+         # modal outputs after that to ensure the correct order
+@@ -1961,8 +1964,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+ 
+         return (
+             num_scheduled_tokens,
+-            num_input_tokens,
+-            num_tokens_after_padding,
+             input_ids,
+             inputs_embeds,
+             positions,
+@@ -2172,20 +2173,75 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                 # Prepare the decoder inputs.
+                 (attn_metadata, logits_indices, spec_decode_metadata,
+                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+-                 max_query_len, ubatch_slices, num_tokens_after_padding
+-                 ) = self._prepare_inputs(scheduler_output)
++                 max_query_len, ubatch_slices,
++                 num_tokens_across_dp) = self._prepare_inputs(scheduler_output)
++
++            # Log batch information (prefill vs decode tokens)
++            num_reqs = self.input_batch.num_reqs
++            if num_reqs > 0:
++                # Get token counts per request
++                num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:
++                                                                               num_reqs]
++                num_scheduled_tokens_np_arr = np.array([
++                    scheduler_output.num_scheduled_tokens[req_id]
++                    for req_id in self.input_batch.req_ids
++                ],
++                                                       dtype=np.int32)
++
++                # Calculate prefill vs decode
++                is_prefill = num_computed_tokens == 0
++                num_prefill_tokens = int(
++                    num_scheduled_tokens_np_arr[is_prefill].sum())
++                num_decode_tokens = int(
++                    num_scheduled_tokens_np_arr[~is_prefill].sum())
++                num_prefill_reqs = int(is_prefill.sum())
++                num_decode_reqs = num_reqs - num_prefill_reqs
++
++                # Log batch information with ubatch details if available
++                if ubatch_slices:
++                    ubatch_info = ", ubatches=[" + ", ".join(
++                        [f"tokens={ub.num_tokens}"
++                         for ub in ubatch_slices]) + "]"
++                else:
++                    ubatch_info = ""
++
++                logger.info(
++                    "Batch[%d reqs, %d scheduled tokens]: "
++                    "prefill=%d tokens(%d reqs), decode=%d tokens(%d reqs)%s",
++                    num_reqs,
++                    scheduler_output.total_num_scheduled_tokens,
++                    num_prefill_tokens,
++                    num_prefill_reqs,
++                    num_decode_tokens,
++                    num_decode_reqs,
++                    ubatch_info,
++                )
++                import sys
++                sys.stdout.flush()
++                sys.stderr.flush()
++
++            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++            dp_group = get_dp_group()
++            dp_rank = dp_group.rank_in_group
++            if ubatch_slices and self.parallel_config.enable_dbo:
++                assert num_tokens_across_dp is not None
++                num_input_tokens = int(num_tokens_across_dp[0].item() * 2)
++                self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
++            elif num_tokens_across_dp is not None:
++                num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
++            else:
++                num_input_tokens = self._get_num_input_tokens(
++                    scheduler_output.total_num_scheduled_tokens)
+ 
+             (
+                 num_scheduled_tokens,
+-                num_input_tokens,
+-                num_tokens_across_dp,
+                 input_ids,
+                 inputs_embeds,
+                 positions,
+                 intermediate_tensors,
+                 model_kwargs,
+-            ) = self._preprocess(scheduler_output, intermediate_tensors,
+-                                 ubatch_slices, num_tokens_after_padding)
++            ) = self._preprocess(scheduler_output, num_input_tokens,
++                                 intermediate_tensors)
+ 
+             uniform_decode = (max_query_len
+                               == self.uniform_decode_query_len) and (
+@@ -2196,9 +2252,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+             cudagraph_runtime_mode, batch_descriptor = \
+                 self.cudagraph_dispatcher.dispatch(batch_descriptor)
+ 
+-        # This is currently to get around the assert in the DPMetadata
+-        # where it wants `num_tokens_across_dp` to align with `num_tokens`
+-        if ubatch_slices is not None:
++        if ubatch_slices is not None and self.parallel_config.enable_dbo:
+             num_input_tokens = ubatch_slices[0].num_tokens
+ 
+         # Run the model.
+@@ -2921,7 +2975,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+ 
+         # We currently only microbatch if the number of tokens is
+         # over a certain threshold.
+-        if self.parallel_config.enable_dbo and allow_microbatching:
++        if self.dynaflow_enabled:
++            ubatch_slices, num_tokens_after_padding = nano_ubatch_split(
++                num_scheduled_tokens,
++                total_num_scheduled_tokens,
++                total_num_scheduled_tokens,
++                is_dummy_run=True,
++                use_cudagraph=cudagraph_runtime_mode ==
++                CUDAGraphMode.PIECEWISE,
++            )
++        elif self.parallel_config.enable_dbo and allow_microbatching:
+             ubatch_slices, num_tokens_after_padding = ubatch_split(
+                 num_scheduled_tokens,
+                 total_num_scheduled_tokens,
+@@ -3503,7 +3566,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                     self.vllm_config,
+                     self.device,
+                     num_metadata_builders=1
+-                    if not self.parallel_config.enable_dbo else 2,
++                    if not self.parallel_config.enable_dbo
++                    and not self.dynaflow_enabled
++                    else 2,
+                 )
+ 
+                 attn_groups.append(attn_group)

@@ -1,9 +1,9 @@
 import itertools
 import os
-from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+from dynaflow.config import DynaFlowConfig
 import torch
 from flashinfer import green_ctx
 from typing_extensions import override
@@ -18,31 +18,23 @@ from dynaflow.interface import (
     InputInfo,
     OperatorHandle,
     OpSchedulerBase,
-    OpSchedulerConfigBase,
     SplitConfig,
 )
 from dynaflow.matching import MatchingRule, Mod, Op
 from dynaflow.utils import pack_tokens
 
 
-@dataclass
-class TokenWeaveSchedulerConfig(OpSchedulerConfigBase):
-    """Configuration options for the TokenWeave example scheduler."""
-
-    min_nano_split_tokens: int
-    max_num_nano_batches: int
-    cudagraph_capture_sizes: list[int]
-
-    @classmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        return TokenWeaveScheduler
-
-
 class TokenWeaveScheduler(OpSchedulerBase):
-    def __init__(self, config: TokenWeaveSchedulerConfig) -> None:
-        super().__init__(config)
-        self.config = config
-        self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
+    def __init__(
+        self,
+        config: DynaFlowConfig,
+    ) -> None:
+        super().__init__()
+        tokenweave_config = config.additional_config
+        self.min_nano_split_tokens = tokenweave_config["min_nano_split_tokens"]
+        self.max_num_nano_batches = config.max_num_splits
+        self.cudagraph_capture_sizes = \
+            config.cudagraph_config.capture_sizes
         self.comm_stream: torch.cuda.Stream = (
             green_ctx.split_device_green_ctx_by_sm_count(
                 dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
@@ -50,6 +42,17 @@ class TokenWeaveScheduler(OpSchedulerBase):
         )  # type: ignore
         self.comp_stream = torch.cuda.Stream()
         self.symm_mem_hdl: Any | None = None
+
+        def _is_final_norm(node_list: list[torch.fx.Node], start_idx: int) -> bool:
+            """Check if this submodule is the final norm by looking at its output.
+            Regular network submodules return (output, residual) tuples;
+            the final norm returns a single value."""
+            for node in node_list:
+                if node.op == "output":
+                    return not isinstance(node.args[0], tuple)
+            return False
+
+        self._is_final_norm = _is_final_norm
 
     def fused_ar_add_rms_norm(
         self,
@@ -119,10 +122,16 @@ class TokenWeaveScheduler(OpSchedulerBase):
 
     @override
     def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
+        ar_norm = (Op(pattern=r"all_reduce"), Mod(target_cls=RMSNorm))
         return {
             MatchingRule(
-                condition=(Op(pattern=r"all_reduce"), Mod(target_cls=RMSNorm))
+                condition=ar_norm,
+                hook=lambda nl, si: not self._is_final_norm(nl, si),
             ): {"ar_add_rms_norm"},
+            MatchingRule(
+                condition=ar_norm,
+                hook=self._is_final_norm,
+            ): {"ar_add_rms_norm", "final-norm"},
             MatchingRule(condition=Op(pattern=r"unified_attention.*")): {
                 "attention",
                 "no-cudagraph",
@@ -143,8 +152,8 @@ class TokenWeaveScheduler(OpSchedulerBase):
         )
 
         if (
-            prefix_sum[mid] < self.config.min_nano_split_tokens
-            or (prefix_sum[-1] - prefix_sum[mid]) < self.config.min_nano_split_tokens
+            prefix_sum[mid] < self.min_nano_split_tokens
+            or (prefix_sum[-1] - prefix_sum[mid]) < self.min_nano_split_tokens
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:
@@ -202,9 +211,8 @@ class TokenWeaveScheduler(OpSchedulerBase):
             for batch_idx, op in ops:
                 ctx.attn_metadata = attn_metadata_list[batch_idx]
                 if "ar_add_rms_norm" in op.tag:
-                    # NOTE(yi): temporary hardcode
                     func = partial(
-                        self.fused_ar_add_rms_norm, op.module_name != "submod_129"
+                        self.fused_ar_add_rms_norm, "final-norm" not in op.tag
                     )
                     with torch.cuda.stream(self.comm_stream):
                         await context.execute((op,), func)

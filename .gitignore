@@ -22,6 +22,7 @@ htmlcov/
 # Editors
 .vscode/
 .idea/
+.claude/
 
 # Project
 .tmp/

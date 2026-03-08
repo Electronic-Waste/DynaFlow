@@ -6,10 +6,9 @@ from typing import Any
 import torch
 
 from dynaflow.config import DynaFlowConfig
-from dynaflow.context import DynaFlowContext, set_forward_context
 from dynaflow.executor import SubgraphBackend
 from dynaflow.interface import OperatorHandle, SplitConfig
-from dynaflow.runtime.env import ExecutionEnvironment
+from dynaflow.runtime.env import ExecutionEnvironment, set_op_handle
 
 
 class DynaFlowEngine:
@@ -38,8 +37,7 @@ class DynaFlowEngine:
         """
         self.graph_module = graph_module
         self.config = config
-        # Input buffers for CUDAGraph capture
-        self.input_buffers = [{}] * config.max_num_nano_batches
+        self.input_buffers = [{}] * config.max_num_splits
 
         # Map submodule names -> FX nodes (used to re-materialize arguments)
         self.module_name_to_node: dict[str, torch.fx.Node] = {}
@@ -90,7 +88,7 @@ class DynaFlowEngine:
         assert split_config.num_nano_batches == 1 and split_config.is_dryrun
         use_fake_nano_batches = split_config.use_cudagraph
         num_nano_batches = (
-            self.config.max_num_nano_batches if use_fake_nano_batches else 1
+            self.config.max_num_splits if use_fake_nano_batches else 1
         )
 
         results: dict[int, Any] = {}
@@ -149,12 +147,14 @@ class DynaFlowEngine:
                         k: env.get(batch_idx, v) if isinstance(v, torch.fx.Node) else v
                         for k, v in node.kwargs.items()
                     }
-                    with set_forward_context(
-                        DynaFlowContext(
-                            nano_batch_idx=(batch_idx,),
-                            num_tokens_padded=(num_tokens,),
-                            is_dryrun=split_config.is_dryrun,
-                            use_cudagraph=split_config.use_cudagraph,
+                    with set_op_handle(
+                        OperatorHandle(
+                            module_name=node.target,
+                            batch_idx=batch_idx,
+                            batch_size=num_tokens,
+                            tag=module.tag,
+                            _is_dryrun=split_config.is_dryrun,
+                            _use_cudagraph=split_config.use_cudagraph,
                         )
                     ):
                         env.put(batch_idx, node, module(*node_args, **node_kwargs))
@@ -175,6 +175,48 @@ class DynaFlowEngine:
             last_events[batch_idx].record()
 
         return {0: results[0]}, last_events
+
+    def execute_single_batch(
+        self,
+        split_config: SplitConfig,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Synchronous single-nano-batch execution without scheduler interaction.
+
+        Copies dynamic input tensors into pre-allocated static buffers (the same
+        tensor objects used during CUDA graph capture), then calls graph_module
+        directly. This keeps CUDA graph replay correct with minimal CPU overhead.
+        """
+        batch_idx = 0
+        num_tokens_padded = split_config.num_tokens_padded[batch_idx]
+
+        new_args = list(args)
+        for node in self.placeholder_nodes:
+            placeholder_idx = self.placeholder_node_to_idx[node]
+            example_value = node.meta.get("example_value", None)
+            if isinstance(example_value, torch.SymInt):
+                new_args[placeholder_idx] = num_tokens_padded
+            elif (
+                isinstance(example_value, torch.Tensor)
+                and isinstance(example_value.shape[0], torch.SymInt)
+                and split_config.use_cudagraph
+            ):
+                buf = self.input_buffers[batch_idx][placeholder_idx]
+                buf[:num_tokens_padded].copy_(args[placeholder_idx])
+                new_args[placeholder_idx] = buf[:num_tokens_padded]
+
+        with set_op_handle(
+            OperatorHandle(
+                module_name=self.graph_module.__class__.__name__,
+                batch_idx=batch_idx,
+                batch_size=num_tokens_padded,
+                tag=set(),
+                _is_dryrun=False,
+                _use_cudagraph=split_config.use_cudagraph,
+            )
+        ):
+            return self.graph_module(*new_args, **kwargs)
 
     async def execute(
         self,
@@ -239,8 +281,11 @@ class DynaFlowEngine:
                     assert isinstance(module.tag, set)
                     op_handle = OperatorHandle(
                         module_name=node.target,
-                        nano_batch_idx=batch_idx,
+                        batch_idx=batch_idx,
+                        batch_size=split_config.num_tokens_padded[batch_idx],
                         tag=module.tag,
+                        _is_dryrun=split_config.is_dryrun,
+                        _use_cudagraph=split_config.use_cudagraph,
                     )
                     await op_queue[batch_idx].put(op_handle)
                     pushed_operators[batch_idx].append(op_handle)
@@ -251,7 +296,7 @@ class DynaFlowEngine:
             node_args = []
             node_kwargs = []
             for op in operators:
-                batch_idx = op.nano_batch_idx
+                batch_idx = op.batch_idx
                 node = self.module_name_to_node[op.module_name]
                 last_events[batch_idx].wait()
                 last_events[batch_idx] = torch.cuda.Event()
@@ -275,16 +320,7 @@ class DynaFlowEngine:
                 if len(operators) != 1:
                     raise NotImplementedError("Operator batching is not implemented")
                 op = operators[0]
-                with set_forward_context(
-                    DynaFlowContext(
-                        nano_batch_idx=(op.nano_batch_idx,),
-                        num_tokens_padded=(
-                            split_config.num_tokens_padded[op.nano_batch_idx],
-                        ),
-                        is_dryrun=split_config.is_dryrun,
-                        use_cudagraph=split_config.use_cudagraph,
-                    )
-                ):
+                with set_op_handle(op):
                     exec_results.append(func(*node_args[0], **node_kwargs[0]))
             elif len(operators) != 1 and all(
                 op.module_name == operators[0].module_name for op in operators
@@ -294,17 +330,17 @@ class DynaFlowEngine:
                     not split_config.use_cudagraph
                 ), "CUDA graph is not supported for operator batching"
                 # module_name = operators[0].module_name
-                # batch_indices = tuple(op.nano_batch_idx for op in operators)
+                # batch_indices = tuple(op.batch_idx for op in operators)
                 with (
                     torch.cuda.nvtx.range(
                         f"op_{operators[0].module_name}_"
-                        f"({','.join(str(op.nano_batch_idx) for op in operators)})"
+                        f"({','.join(str(op.batch_idx) for op in operators)})"
                     ),
                     set_forward_context(
                         DynaFlowContext(
-                            nano_batch_idx=tuple(op.nano_batch_idx for op in operators),
+                            batch_idx=tuple(op.batch_idx for op in operators),
                             num_tokens_padded=tuple(
-                                split_config.num_tokens_padded[op.nano_batch_idx]
+                                split_config.num_tokens_padded[op.batch_idx]
                                 for op in operators
                             ),
                             is_dryrun=split_config.is_dryrun,
@@ -336,27 +372,15 @@ class DynaFlowEngine:
                 for idx, op in enumerate(operators):
                     with (
                         torch.cuda.nvtx.range(
-                            f"op_{op.module_name}_{op.nano_batch_idx}"
+                            f"op_{op.module_name}_{op.batch_idx}"
                         ),
-                        set_forward_context(
-                            DynaFlowContext(
-                                nano_batch_idx=(op.nano_batch_idx,),
-                                num_tokens_padded=(
-                                    split_config.num_tokens_padded[op.nano_batch_idx],
-                                ),
-                                is_dryrun=split_config.is_dryrun,
-                                use_cudagraph=split_config.use_cudagraph,
-                            )
-                        ),
+                        set_op_handle(op),
                     ):
                         module = getattr(self.graph_module, op.module_name)
-                        # print(f"{op} starting execution")
                         exec_results.append(module(*node_args[idx], **node_kwargs[idx]))
-                        # torch.cuda.synchronize()
-                        # print(f"{op} finished execution")
 
             for op, result in zip(operators, exec_results):
-                batch_idx = op.nano_batch_idx
+                batch_idx = op.batch_idx
                 node = self.module_name_to_node[op.module_name]
                 last_events[batch_idx].record()
                 env.put(batch_idx, node, result)
@@ -422,6 +446,9 @@ class DynaFlowEngine:
             if isinstance(example_value, torch.Tensor):
                 if isinstance(example_value.shape[0], torch.SymInt):
                     if split_config.use_cudagraph:
+                        print(f"Copying input tensor of shape {args[placeholder_idx].shape} into static buffer for batch {batch_idx}, placeholder {placeholder_idx}, num_tokens {num_tokens}")
+                        import sys
+                        sys.stdout.flush()
                         assert self.input_buffers is not None
                         assert (
                             self.input_buffers[batch_idx].get(placeholder_idx)

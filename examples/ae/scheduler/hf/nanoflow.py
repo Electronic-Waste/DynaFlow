@@ -1,5 +1,4 @@
 import itertools
-from dataclasses import dataclass
 
 import torch
 from typing_extensions import override
@@ -8,33 +7,27 @@ from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
     OpSchedulerBase,
-    OpSchedulerConfigBase,
     SplitConfig,
 )
 from dynaflow.matching import MatchingRule, Op
 from dynaflow.utils import pack_tokens
 
 
-@dataclass
-class NanoFlowSchedulerConfig(OpSchedulerConfigBase):
-    """Configuration options for the NanoFlow example scheduler."""
-
-    min_nano_split_tokens: int
-    max_num_nano_batches: int
-    cudagraph_capture_sizes: list[int]
-
-    @classmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        return NanoFlowScheduler
-
-
 class NanoFlowScheduler(OpSchedulerBase):
     """Simple scheduler that overlaps network and compute when possible."""
 
-    def __init__(self, config: NanoFlowSchedulerConfig) -> None:
-        super().__init__(config, policy_name="nanoflow")
-        self.config = config
-        self.cudagraph_capture_sizes = config.cudagraph_capture_sizes
+    def __init__(
+        self,
+        *,
+        min_nano_split_tokens: int,
+        max_num_nano_batches: int,
+        cudagraph_capture_sizes: list[int],
+        **kwargs,
+    ) -> None:
+        super().__init__(policy_name="nanoflow")
+        self.min_nano_split_tokens = min_nano_split_tokens
+        self.max_num_nano_batches = max_num_nano_batches
+        self.cudagraph_capture_sizes = cudagraph_capture_sizes
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
 
@@ -80,7 +73,7 @@ class NanoFlowScheduler(OpSchedulerBase):
         input_info: InputInfo,
         use_cudagraph: bool,
     ) -> SplitConfig:
-        assert self.config and self.cudagraph_capture_sizes
+        assert self.cudagraph_capture_sizes
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
         mid = min(
             range(len(prefix_sum)),
@@ -88,8 +81,8 @@ class NanoFlowScheduler(OpSchedulerBase):
         )
 
         if (
-            prefix_sum[mid] < self.config.min_nano_split_tokens
-            or (prefix_sum[-1] - prefix_sum[mid]) < self.config.min_nano_split_tokens
+            prefix_sum[mid] < self.min_nano_split_tokens
+            or (prefix_sum[-1] - prefix_sum[mid]) < self.min_nano_split_tokens
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:

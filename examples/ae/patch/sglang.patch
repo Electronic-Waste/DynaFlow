@@ -1,0 +1,1003 @@
+diff --git a/python/sglang/bench_one_batch.py b/python/sglang/bench_one_batch.py
+index 86189fa..543e38d 100644
+--- a/python/sglang/bench_one_batch.py
++++ b/python/sglang/bench_one_batch.py
+@@ -269,7 +269,7 @@ def prepare_synthetic_inputs_for_latency_test(
+ 
+ 
+ @torch.no_grad
+-def extend(reqs, model_runner):
++def extend(reqs, model_runner: ModelRunner):
+     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+     dummy_tree_cache = SimpleNamespace(
+         page_size=model_runner.server_args.page_size,
+@@ -296,7 +296,9 @@ def extend(reqs, model_runner):
+ 
+ 
+ @torch.no_grad
+-def decode(input_token_ids, batch, model_runner):
++def decode(input_token_ids, batch: ScheduleBatch, model_runner: ModelRunner):
++    print(f"decode {input_token_ids.shape=}")
++    assert input_token_ids.shape[0] == batch.batch_size(), f"{input_token_ids.shape=}, {batch.batch_size()=}"
+     batch.output_ids = input_token_ids
+     batch.prepare_for_decode()
+     _maybe_prepare_mlp_sync_batch(batch, model_runner)
+diff --git a/python/sglang/srt/compilation/backend.py b/python/sglang/srt/compilation/backend.py
+index 7eb6503..5734967 100644
+--- a/python/sglang/srt/compilation/backend.py
++++ b/python/sglang/srt/compilation/backend.py
+@@ -3,6 +3,7 @@
+ 
+ import ast
+ import dataclasses
++from gc import enable
+ import logging
+ import os
+ import pprint
+@@ -11,6 +12,9 @@ from collections.abc import Sequence
+ from contextlib import contextmanager
+ from typing import Any, Callable, Optional
+ 
++from sglang.srt.model_executor.schedflow import get_manager, get_scheduler
++
++from sglang.srt.server_args import ServerArgs
+ import torch
+ import torch.fx as fx
+ from torch._dispatch.python import enable_python_dispatcher
+@@ -21,6 +25,9 @@ from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdap
+ from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+ from sglang.srt.compilation.pass_manager import PostGradPassManager
+ 
++from schedflow.config import CUDAGraphConfig, InductorConfig, SchedFlowConfig
++from schedflow.example.sglang.nanoflow import NanoFlowSchedulerConfig
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -344,10 +351,12 @@ class SGLangBackend:
+ 
+     def __init__(
+         self,
++        server_args: ServerArgs,
+         config: CompilationConfig,
+         graph_pool: Any,
+     ):
+         assert graph_pool is not None
++        self.server_args = server_args
+         self.graph_pool = graph_pool
+ 
+         self.post_grad_pass_manager = PostGradPassManager()
+@@ -365,6 +374,39 @@ class SGLangBackend:
+         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
+ 
+     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
++        if self.server_args.enable_nano_batch_split:
++            # schedflow forward logic
++
++            scheduler_config = NanoFlowSchedulerConfig(
++                min_nano_split_tokens=self.server_args.min_nano_split_tokens,
++                max_num_nano_batches=self.server_args.max_num_nano_batches,
++                cudagraph_capture_sizes=[],
++            )
++            scheduler = get_scheduler(scheduler_config)
++            inductor_config = InductorConfig(
++                enabled=False,
++                compile_sizes=set(
++                    []
++                )
++            )
++            cudagraph_config = CUDAGraphConfig(
++                enabled=False,
++                capture_sizes=[],
++            )
++            schedflow_config = SchedFlowConfig(
++                max_num_nano_batches=scheduler_config.max_num_nano_batches,
++                min_nano_split_tokens=scheduler_config.min_nano_split_tokens,
++                inductor_config=inductor_config,
++                cudagraph_config=cudagraph_config,
++            )
++            return get_manager(
++                graph,
++                schedflow_config,
++                scheduler,
++                example_inputs,
++            ).get_callable()
++        
++        
+         base_cache_dir = os.path.expanduser(
+             os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
+         )
+diff --git a/python/sglang/srt/compilation/compile.py b/python/sglang/srt/compilation/compile.py
+index a77f5ae..e661053 100644
+--- a/python/sglang/srt/compilation/compile.py
++++ b/python/sglang/srt/compilation/compile.py
+@@ -8,6 +8,7 @@ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from typing import Any, Callable, Optional, Union
+ 
++from sglang.srt.server_args import ServerArgs
+ import torch
+ 
+ from sglang.srt.compilation.compilation_config import CompilationConfig
+@@ -119,6 +120,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
+ 
+ def install_torch_compiled(
+     module: torch.nn.Module,
++    server_args: ServerArgs,
+     *,
+     dynamic_arg_dims: dict[str, Union[int, list[int]]] | None = None,
+     backend_factory: Optional[Callable[[torch.fx.GraphModule, list], Callable]] = None,
+@@ -136,7 +138,10 @@ def install_torch_compiled(
+     if backend_factory is None:
+         from sglang.srt.compilation.backend import SGLangBackend
+ 
+-        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
++        # [jbluo]: debug
++        assert compile_config is not None, "compile_config must be provided"
++        assert graph_pool is not None, "graph_pool must be provided"
++        backend_factory = lambda gm, ex: SGLangBackend(server_args, compile_config, graph_pool)(
+             gm, ex
+         )
+ 
+@@ -184,12 +189,14 @@ def install_torch_compiled(
+         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)
+ 
+         bound = types.MethodType(unbound_fwd, self)
++        
++        # [jbluo]: Here SGLangBackend's __call__ is invoked
+         compiled_callable = torch.compile(
+             bound, fullgraph=fullgraph, backend=backend_factory
+         )
+ 
+-        # Trigger Dynamo so bytecode hook can capture
+-        compiled_callable(*args, **kwargs)
++        # # Trigger Dynamo so bytecode hook can capture
++        # compiled_callable(*args, **kwargs)
+ 
+         state["compiled"] = True
+         state["compiled_callable"] = compiled_callable
+@@ -206,5 +213,7 @@ def install_torch_compiled(
+             # Explicitly run the original uncompiled forward
+             return unbound_fwd(self, *args, **kwargs)
+ 
++    # [jbluo]: model_runner.model.model.forward is replaced here
++    print(f"Installing torch.compile trampoline on {module.__class__.__name__}.forward")
+     module.forward = types.MethodType(trampoline, module)
+     return module
+diff --git a/python/sglang/srt/compilation/piecewise_context_manager.py b/python/sglang/srt/compilation/piecewise_context_manager.py
+index 38d17a6..f1bad45 100644
+--- a/python/sglang/srt/compilation/piecewise_context_manager.py
++++ b/python/sglang/srt/compilation/piecewise_context_manager.py
+@@ -1,22 +1,53 @@
++from ast import For
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+-from typing import Any, List, Optional
++from typing import TYPE_CHECKING, Any, List, Optional
+ 
+-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++
++from sglang.srt.utils.ubatch_utils import UBatchSlices
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
+ @dataclass
+ class ForwardContext:
+-    def __init__(self):
+-        self.forward_batch = None
+-        self.attention_layer = None
++    def __init__(
++        self,
++        forward_batch: Optional["ForwardBatch"] = None,
++        attention_layers: Optional[List[Any]] = None,
++        metadata: Optional[Any] = None,
++        ubatch_slices: Optional[UBatchSlices] = None,
++    ):
++        self.forward_batch = forward_batch
++        self.attention_layers = attention_layers
++        self.metadata = metadata
++        self.ubatch_slices = ubatch_slices
++        self.ubatch_contexts: Optional[List["ForwardContext"]] = None
++        
++        if self.ubatch_slices is not None:
++            # print(f"ForwardContext initialized with {len(self.ubatch_slices)} ubatch slices.") 
++            ubatches, metadatas = forward_batch.get_ubatches_and_metadatas()
++            self.ubatch_contexts = [
++                ForwardContext(
++                    forward_batch=ubatch,
++                    attention_layers=attention_layers,
++                    metadata=metadata,
++                    ubatch_slices=None,
++                ) for ubatch, metadata in zip(ubatches, metadatas)
++            ]
++            
+ 
+-    def set_forward_batch(self, forward_batch: ForwardBatch):
++    def set_forward_batch(self, forward_batch: "ForwardBatch"):
+         self.forward_batch = forward_batch
+ 
+     def set_attention_layers(self, layers: List[Any]):
+         self.attention_layers = layers
+ 
++    def set_ubatch_slices(self, ubatch_slices: UBatchSlices):
++        self.ubatch_slices = ubatch_slices
++        
++
+ 
+ _forward_context: Optional[ForwardContext] = None
+ 
+@@ -26,14 +57,28 @@ def get_forward_context() -> Optional[ForwardContext]:
+         return None
+     return _forward_context
+ 
++def replace_forward_context(new_context: ForwardContext):
++    global _forward_context
++    _forward_context = new_context
++    _forward_context.forward_batch.attn_backend.replace_forward_metadata(new_context.metadata)
++    # print(f"Forward context replaced. batch size: {new_context.forward_batch.batch_size} metadata: {new_context.forward_batch.attn_backend}")
++
+ 
+ @contextmanager
+-def set_forward_context(forward_batch: ForwardBatch, attention_layers: List[Any]):
++def set_forward_context(
++    forward_batch: "ForwardBatch",
++    attention_layers: List[Any],
++    ubatch_slices: Optional[UBatchSlices] = None,
++):
+     global _forward_context
+     prev_forward_context = _forward_context
+-    _forward_context = ForwardContext()
+-    _forward_context.set_forward_batch(forward_batch)
+-    _forward_context.set_attention_layers(attention_layers)
++    _forward_context = ForwardContext(
++        forward_batch=forward_batch, 
++        attention_layers=attention_layers, 
++        ubatch_slices=ubatch_slices,
++    )
++    
++    # print(f"set_forward_context: {forward_batch.batch_size=}, {len(attention_layers)=}, {ubatch_slices=}")
+     try:
+         yield
+     finally:
+diff --git a/python/sglang/srt/layers/attention/base_attn_backend.py b/python/sglang/srt/layers/attention/base_attn_backend.py
+index dcbf1c8..8b23fbe 100644
+--- a/python/sglang/srt/layers/attention/base_attn_backend.py
++++ b/python/sglang/srt/layers/attention/base_attn_backend.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING, Any, Optional
+ 
+ import torch
+ 
+@@ -19,6 +19,10 @@ class AttentionBackend(ABC):
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         """Init the metadata for a forward pass."""
+         raise NotImplementedError()
++    
++    @abstractmethod
++    def replace_forward_metadata(self, metadata: Any):
++        raise NotImplementedError()
+ 
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         """Init the global shared states for cuda graph."""
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 8d8f789..2aaf39e 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -4,6 +4,7 @@ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+ import numpy as np
++from sglang.srt.utils.ubatch_utils import UBatchSlice
+ import torch
+ import triton
+ import triton.language as tl
+@@ -68,6 +69,36 @@ class FlashAttentionMetadata:
+ 
+     # For sliding window attention topk>1 spec decoding
+     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
++    
++    # [jbluo]: For SchedFlow
++    def get_ubatch_metadata(self, ubatch_silce: UBatchSlice):
++        assert self.window_size == (-1, -1), "This is SchedFlow. Gemma is not yet supported."
++        assert self.encoder_cu_seqlens_k is None, "This is SchedFlow. Encoder-Decoder is not yet supported."
++        assert self.local_attn_metadata is None, "This is SchedFlow. Local Attention is not yet supported."
++        assert self.swa_spec_metadata is None, "This is SchedFlow. SWA Spec Decoding is not yet supported."
++        
++        cache_seqlens_int32 = self.cache_seqlens_int32[
++            ubatch_silce.request_slice
++        ]
++        max_seq_len_k = cache_seqlens_int32.max().item()
++        max_seq_len_q = max_seq_len_k
++        cu_seqlens_k = torch.nn.functional.pad(
++            torch.cumsum(
++                cache_seqlens_int32, dim=0, dtype=torch.int32
++            ),
++            (1, 0),
++        )
++        cu_seqlens_q = cu_seqlens_k.clone()
++        page_table = self.page_table[ubatch_silce.request_slice]
++        
++        return FlashAttentionMetadata(
++            cache_seqlens_int32=cache_seqlens_int32,
++            max_seq_len_q=max_seq_len_q,
++            max_seq_len_k=max_seq_len_k,
++            cu_seqlens_q=cu_seqlens_q,
++            cu_seqlens_k=cu_seqlens_k,
++            page_table=page_table,
++        )
+ 
+ 
+ # Copied from:
+@@ -645,6 +676,9 @@ class FlashAttentionBackend(AttentionBackend):
+             )
+ 
+         self.forward_metadata = metadata
++        
++    def replace_forward_metadata(self, metadata: FlashAttentionMetadata):
++        self.forward_metadata = metadata
+ 
+     def forward_extend(
+         self,
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index b67acbc..9c80ed5 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -7,6 +7,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from sglang.srt.utils.ubatch_utils import UBatchSlice
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
+@@ -50,6 +51,56 @@ class ForwardMetadata:
+     window_kv_indices: torch.Tensor
+     window_num_kv_splits: torch.Tensor
+     window_kv_offsets: torch.Tensor
++    
++    # [jbluo]: For SchedFlow    
++    def get_ubatch_metadata(self, ubatch_slice: UBatchSlice) -> ForwardMetadata:
++        assert self.custom_mask is None, "Not supported yet"
++        assert self.mask_indptr is None, "Not supported yet"
++        assert self.window_kv_indptr is None, "Not supported yet"
++        assert self.window_kv_indices is None, "Not supported yet"
++        assert self.window_num_kv_splits is None, "Not supported yet"
++        assert self.window_kv_offsets is None, "Not supported yet"
++        
++        attn_logits = self.attn_logits[ubatch_slice.request_slice].clone() if self.attn_logits is not None else None
++        attn_lse = self.attn_lse[ubatch_slice.request_slice].clone() if self.attn_lse is not None else None
++        max_extend_len = self.max_extend_len
++        num_kv_splits = self.num_kv_splits[ubatch_slice.request_slice].clone() if self.num_kv_splits is not None else None
++        kv_indptr = torch.nn.functional.pad(
++            self.kv_indptr[1:][ubatch_slice.request_slice] - self.kv_indptr[ubatch_slice.request_slice.start],
++            (1, 0),
++        )
++        
++        kv_indices = self.kv_indices[
++            self.kv_indptr[ubatch_slice.request_slice.start] : self.kv_indptr[ubatch_slice.request_slice.stop]
++        ].clone()
++        qo_indptr = torch.nn.functional.pad(
++            self.qo_indptr[1:][ubatch_slice.request_slice] - self.qo_indptr[ubatch_slice.request_slice.start],
++            (1, 0),
++        ) if self.qo_indptr is not None else None
++
++        # print(f"get_ubatch_metadata {ubatch_slice=} {max_extend_len=} {num_kv_splits=} {self.kv_indptr[1:][ubatch_slice.request_slice]=} {kv_indptr=} {kv_indices=} {qo_indptr=}")
++
++        custom_mask = None
++        mask_indptr = None
++        window_kv_indptr = None
++        window_kv_indices = None
++        window_num_kv_splits = None
++        window_kv_offsets = None
++        return ForwardMetadata(
++            attn_logits,
++            attn_lse,
++            max_extend_len,
++            num_kv_splits,
++            kv_indptr,
++            kv_indices,
++            qo_indptr,
++            custom_mask,
++            mask_indptr,
++            window_kv_indptr,
++            window_kv_indices,
++            window_num_kv_splits,
++            window_kv_offsets,
++        )
+ 
+ 
+ class TritonAttnBackend(AttentionBackend):
+@@ -170,6 +221,9 @@ class TritonAttnBackend(AttentionBackend):
+         self.forward_metadata: ForwardMetadata = None
+ 
+         self.cuda_graph_custom_mask = None
++        
++    def replace_forward_metadata(self, metadata: ForwardMetadata):
++        self.forward_metadata = metadata
+ 
+     def get_num_kv_splits(
+         self,
+@@ -832,6 +886,7 @@ class TritonAttnBackend(AttentionBackend):
+             kv_indices = self.forward_metadata.kv_indices
+             window_kv_offsets = None
+ 
++        # print(f"TritonAttnBackend. forward_extend. {self.forward_metadata=}")
+         self.extend_attention_fwd(
+             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+             k.contiguous(),
+diff --git a/python/sglang/srt/layers/attention/triton_ops/decode_attention.py b/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+index 1ba5d46..c21ec05 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
++++ b/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+@@ -733,6 +733,9 @@ def decode_attention_fwd(
+     xai_temperature_len=-1,
+ ):
+     assert max_kv_splits == attn_logits.shape[2]
++    if q.shape[0] > kv_indptr.shape[0] - 1:
++        q = q[:kv_indptr.shape[0] - 1]
++        o = o[:kv_indptr.shape[0] - 1]
+     assert q.shape[0] <= kv_indptr.shape[0] - 1
+     assert q.shape[0] <= attn_logits.shape[0]
+ 
+diff --git a/python/sglang/srt/layers/radix_attention.py b/python/sglang/srt/layers/radix_attention.py
+index 9d65365..aeed302 100644
+--- a/python/sglang/srt/layers/radix_attention.py
++++ b/python/sglang/srt/layers/radix_attention.py
+@@ -109,7 +109,7 @@ class RadixAttention(nn.Module):
+             else:
+                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+ 
+-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
++        if get_forward_context() is not None:
+             output = torch.empty_like(q)
+             torch.ops.sglang.unified_attention_with_output(
+                 q, k, v, output, save_kv_cache, self.layer_id
+@@ -139,6 +139,7 @@ def unified_attention_with_output(
+     forward_batch = context.forward_batch
+     attention_layers = context.attention_layers
+     attention_layer = attention_layers[layer_id]
++    # print(f"key shape: {key.shape} value shape: {value.shape} output shape: {output.shape}")
+     ret = forward_batch.attn_backend.forward(
+         query, key, value, attention_layer, forward_batch, save_kv_cache
+     )
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 682213e..80a174b 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ import enum
+ 
++from sglang.srt.utils.ubatch_utils import UBatchSlices
++
+ # Copyright 2023-2024 SGLang Team
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -1033,6 +1035,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+     # hicache pointer for synchronizing data loading from CPU to GPU
+     hicache_consumer_index: int = -1
++    
++    # For schedflow
++    ubatch_slices: Optional[UBatchSlices] = None
+ 
+     @classmethod
+     def init_new(
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 0a623d4..9140ee4 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -346,6 +346,8 @@ class TpModelWorker(BaseTpWorker):
+             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+ 
+             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
++            
++            # print(f"TpModelWorker forward_batch_generation, {forward_batch.input_ids.shape=} batch_size={forward_batch.batch_size}, seq_lens={forward_batch.seq_lens}, device={forward_batch.input_ids.device}")
+         else:
+             # FIXME(lsyin): unify the interface of forward_batch
+             assert forward_batch is not None
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 9d3b9eb..7e1b19e 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -766,8 +766,12 @@ class MHATokenToKVPool(KVCache):
+                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+             current_stream.wait_stream(self.alt_stream)
+         else:
+-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
++            if loc.shape[0] != cache_k.shape[0]:
++                self.k_buffer[layer_id - self.start_layer][loc] = cache_k[:loc.shape[0]]
++                self.v_buffer[layer_id - self.start_layer][loc] = cache_v[:loc.shape[0]]
++            else:
++                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
++                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+ 
+     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+         N = tgt_loc.numel()
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 03d24cc..f99397d 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -32,7 +32,11 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ from enum import IntEnum, auto
+ from functools import total_ordering
+-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
++
++import copy
++
++from sglang.srt.model_executor.schedflow import nano_ubatch_split
+ 
+ import torch
+ import triton
+@@ -56,6 +60,8 @@ if TYPE_CHECKING:
+     from sglang.srt.model_executor.model_runner import ModelRunner
+     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
++    from sglang.srt.utils.ubatch_utils import UBatchSlice
++    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+ 
+ _is_npu = is_npu()
+ 
+@@ -316,6 +322,9 @@ class ForwardBatch:
+     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+     tbo_children: Optional[List[ForwardBatch]] = None
+ 
++    # For schedflow
++    ubatch_slices: Optional[List["UBatchSlice"]] = None
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -454,6 +463,45 @@ class ForwardBatch:
+ 
+         return ret
+ 
++    def get_ubatches_and_metadatas(self) -> Tuple[List["ForwardBatch"], List[Any]]:
++        """For SchedFlow: Split the current ForwardBatch into multiple UBatch ForwardBatches."""
++        # [jbluo] Note: Here we only take the things that are used in FA3. All these codes are for unified attention op.
++        assert (
++            self.ubatch_slices is not None
++        ), "prepare_ubatch_slices() must be called first."
++        ubatches = [
++            ForwardBatch(
++                forward_mode=self.forward_mode,
++                batch_size=ubatch_slice.num_requests,
++                input_ids=self.input_ids[ubatch_slice.request_slice].clone(),
++                req_pool_indices=self.req_pool_indices[ubatch_slice.request_slice].clone(),
++                seq_lens=self.seq_lens[ubatch_slice.request_slice].clone(),
++                out_cache_loc=self.out_cache_loc[ubatch_slice.token_slice].clone(),
++                seq_lens_sum=ubatch_slice.num_tokens,
++                orig_seq_lens=(
++                    self.orig_seq_lens[ubatch_slice.request_slice].clone()
++                    if self.orig_seq_lens is not None
++                    else None
++                ),
++                seq_lens_cpu=(
++                    self.seq_lens_cpu[ubatch_slice.request_slice].clone()
++                    if self.seq_lens_cpu is not None
++                    else None
++                ),
++                positions=self.positions[ubatch_slice.token_slice].clone(),
++                token_to_kv_pool=self.token_to_kv_pool,
++                attn_backend=self.attn_backend, # ubatches use same attn_backend
++            )
++            for ubatch_slice in self.ubatch_slices
++        ]
++        
++        metadatas = [
++            self.attn_backend.forward_metadata.get_ubatch_metadata(ubatch_slice)
++            for ubatch_slice in self.ubatch_slices
++        ]
++
++        return ubatches, metadatas
++
+     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
+         """
+         Merge all multimodal inputs in the batch into a single MultiModalInputs object.
+@@ -917,6 +965,9 @@ class ForwardBatch:
+     def can_run_tbo(self):
+         return self.tbo_split_seq_index is not None
+ 
++    def prepare_ubatch_slices(self):
++        self.ubatch_slices, _ = nano_ubatch_split(self, False, False)
++
+ 
+ def enable_num_token_non_padded(server_args):
+     return get_moe_expert_parallel_world_size() > 1
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index ca67da7..f2ed515 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -2147,10 +2147,6 @@ class ModelRunner:
+         if not self.is_generation:
+             kwargs["get_embedding"] = True
+ 
+-        if self.piecewise_cuda_graph_runner is not None:
+-            if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+-                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+-
+         return self.model.forward(
+             forward_batch.input_ids,
+             forward_batch.positions,
+@@ -2170,7 +2166,29 @@ class ModelRunner:
+             forward_batch,
+             **kwargs,
+         )
+-
++        
++    def forward_schedflow(
++        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False, pp_proxy_tensors=None,
++    ) -> LogitsProcessorOutput:
++        if not skip_attn_backend_init:
++            self.attn_backend.init_forward_metadata(forward_batch)
++            
++        kwargs = {}        
++        if forward_batch.forward_mode.is_extend():
++            if self.support_pp:
++                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
++            if forward_batch.input_embeds is not None:
++                kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
++            if not self.is_generation:
++                kwargs["get_embedding"] = True
++        elif forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_idle():
++            if self.support_pp:
++                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
++            
++        assert self.piecewise_cuda_graph_runner is not None
++        # [SchedFlow] In schedflow, we always use piecewise cuda graph
++        return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)    
++        
+     def forward_split_prefill(
+         self,
+         forward_batch: ForwardBatch,
+@@ -2227,6 +2245,13 @@ class ModelRunner:
+         reinit_attn_backend: bool = False,
+         split_forward_count: int = 1,
+     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
++        if self.server_args.enable_nano_batch_split:
++            return self.forward_schedflow(
++                forward_batch,
++                skip_attn_backend_init=skip_attn_backend_init,
++                pp_proxy_tensors=pp_proxy_tensors,
++            ), False
++        
+         mode_check = (
+             forward_batch.forward_mode.is_cpu_graph
+             if self.device == "cpu"
+diff --git a/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py b/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
+index e4af95d..a6a43e9 100644
+--- a/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
+@@ -132,6 +132,7 @@ class PiecewiseCudaGraphRunner:
+     def __init__(self, model_runner: ModelRunner):
+         # Parse args
+         self.model_runner = model_runner
++        self.server_args = model_runner.server_args
+         self.device = model_runner.device
+         self.device_module = torch.get_device_module(self.device)
+         self.graphs = {}
+@@ -168,7 +169,11 @@ class PiecewiseCudaGraphRunner:
+             self.capture_hidden_mode = CaptureHiddenMode.FULL
+ 
+         # Attention backend
+-        self.max_num_tokens = max(self.capture_num_tokens)
++        self.max_num_tokens = (
++            self.server_args.max_prefill_tokens
++            if self.server_args.enable_nano_batch_split
++            else max(self.capture_num_tokens)
++        )
+ 
+         # Graph inputs
+         with torch.device(self.device):
+@@ -191,6 +196,7 @@ class PiecewiseCudaGraphRunner:
+         ) as patched_model:
+             install_torch_compiled(
+                 patched_model,
++                server_args=self.server_args,
+                 fullgraph=True,
+                 dynamic_arg_dims=None,
+                 compile_config=self.compile_config,
+@@ -212,6 +218,7 @@ class PiecewiseCudaGraphRunner:
+         self.raw_num_tokens = 0
+ 
+     def warmup_and_capture(self):
++        print(f"[TP {self.model_runner.tp_rank}] PiecewiseCudaGraphRunner warmup_and_capture.")
+         num_tokens = 2
+         with torch.device(self.device):
+             forward_batch = ForwardBatch(
+@@ -249,8 +256,15 @@ class PiecewiseCudaGraphRunner:
+                 global_forward_mode=ForwardMode.EXTEND,
+                 lora_ids=None,
+             )
++        forward_batch.prepare_ubatch_slices()
++        
++        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
++
++        with set_forward_context(forward_batch, self.attention_layers, forward_batch.ubatch_slices):
++            print(f"[TP {self.model_runner.tp_rank}] PiecewiseCudaGraphRunner warmup_and_capture. prepared ubatch slices: {forward_batch.ubatch_slices}, going to model.forward")
++            import sys
++            sys.stdout.flush()
+ 
+-        with set_forward_context(forward_batch, self.attention_layers):
+             _ = self.model_runner.model.forward(
+                 forward_batch.input_ids,
+                 forward_batch.positions,
+@@ -366,6 +380,8 @@ class PiecewiseCudaGraphRunner:
+                 lora_ids=None,
+             )
+             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
++            
++
+ 
+         if lora_ids is not None:
+             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+@@ -381,9 +397,11 @@ class PiecewiseCudaGraphRunner:
+             # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+             # It is True in this context but we need to set it to use low latency deepep mode.
+             set_is_extend_in_batch(False)
++            
++            forward_batch.prepare_ubatch_slices()
+ 
+             kwargs = {}
+-            with set_forward_context(forward_batch, self.attention_layers):
++            with set_forward_context(forward_batch, self.attention_layers, forward_batch.ubatch_slices):
+                 self.model_runner.model.forward(
+                     forward_batch.input_ids,
+                     forward_batch.positions,
+@@ -403,23 +421,29 @@ class PiecewiseCudaGraphRunner:
+         self,
+         forward_batch: ForwardBatch,
+         **kwargs,
+-    ):
++    ):      
+         num_tokens = len(forward_batch.input_ids)
+-        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+-        static_num_tokens = self.capture_num_tokens[index]
+         self.raw_num_tokens = num_tokens
++
++        if self.server_args.enable_nano_batch_split:
++            # The minimum number of tokens to avoid recompilation
++            # https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler_dynamo_deepdive.html#are-always-specialized
++            static_num_tokens = max(num_tokens, 2)
++        else:
++            # CUDA graph inputs prepare logic
++            index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
++            static_num_tokens = self.capture_num_tokens[index]
+         if static_num_tokens != num_tokens:
+             self.out_cache_loc.zero_()
+-        bs = forward_batch.batch_size
+-
+         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
+         self.positions[:num_tokens].copy_(forward_batch.positions)
+         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+-
+         input_ids = self.input_ids[:static_num_tokens]
+         positions = self.positions[:static_num_tokens]
+         out_cache_loc = self.out_cache_loc[:static_num_tokens]
+ 
++        bs = forward_batch.batch_size
++
+         next_token_logits_buffer = None
+         mrope_positions = None
+ 
+@@ -466,6 +490,8 @@ class PiecewiseCudaGraphRunner:
+             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
+             top_p=forward_batch.top_p,
+         )
++        
++        static_forward_batch.prepare_ubatch_slices()
+ 
+         return static_forward_batch
+ 
+@@ -476,7 +502,7 @@ class PiecewiseCudaGraphRunner:
+     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+         # Replay
+-        with set_forward_context(static_forward_batch, self.attention_layers):
++        with set_forward_context(static_forward_batch, self.attention_layers, static_forward_batch.ubatch_slices):
+             with set_compiled(True):
+                 output = self.model_runner.model.forward(
+                     static_forward_batch.input_ids,
+diff --git a/python/sglang/srt/model_executor/schedflow.py b/python/sglang/srt/model_executor/schedflow.py
+new file mode 100644
+index 0000000..37c7b38
+--- /dev/null
++++ b/python/sglang/srt/model_executor/schedflow.py
+@@ -0,0 +1,101 @@
++from sglang.srt.utils.ubatch_utils import UBatchSlice, UBatchSlices
++import torch
++from typing import TYPE_CHECKING, Any, Optional
++from schedflow.config import SchedFlowConfig
++from schedflow.manager import SchedFlowManager
++
++
++from schedflow.interface import OpSchedulerBase, SplitConfig
++from schedflow.example.sglang.nanoflow import (
++    NanoFlowScheduler,
++    NanoFlowSchedulerConfig,
++)
++import logging
++logger = logging.getLogger(__name__)
++
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++
++
++    
++_manager = SchedFlowManager()
++_scheduler: Optional[NanoFlowScheduler] = None
++
++
++def get_scheduler(
++    config: NanoFlowSchedulerConfig,
++) -> NanoFlowScheduler:
++    global _scheduler
++    if isinstance(config, NanoFlowSchedulerConfig):
++        _scheduler = NanoFlowScheduler(config)
++    else:
++        raise ValueError(f"Invalid scheduler config: {config}")
++    return _scheduler
++
++def get_manager(
++    graph_module: torch.fx.GraphModule,
++    config: SchedFlowConfig,
++    scheduler: OpSchedulerBase,
++    example_inputs: list[Any],
++) -> SchedFlowManager:
++    global _manager
++    _manager.initialize(graph_module, config, scheduler, example_inputs)
++    return _manager
++
++
++def nano_ubatch_split(
++    batch: "ForwardBatch",
++    is_dummy_run: bool = False,
++    use_cudagraph: bool = False,
++) -> tuple[UBatchSlices, torch.Tensor]:
++    """
++    Prepare two UBatch-compatible nano-batch slices.
++
++    - Uses nano_manager.prepare_nano_split to decide if splitting is beneficial
++      (i.e., num_nano_batches > 1).
++    - Computes a single token split point using custom logic to remain
++      compatible with UBatch execution.
++    """
++
++    batch_size = batch.batch_size
++    if batch.forward_mode.is_extend():
++        num_tokens = batch.extend_seq_lens.tolist()
++    elif batch.forward_mode.is_decode():
++        num_tokens = [1] * batch.input_ids.shape[0]
++    else:
++        raise ValueError(f"SchedFlow: unsupported forward mode: {batch.forward_mode}")
++    print(f"Preparing nano-batch split for {batch.input_ids.shape=} {batch_size=}, {num_tokens=}, {is_dummy_run=}, {use_cudagraph=}")
++    split_config = _manager.prepare(
++        batch_size,
++        num_tokens=num_tokens,
++        is_dryrun=is_dummy_run,
++        use_cudagraph=use_cudagraph,
++    )
++    print(f"Obtained split config: {split_config}")
++    
++    dp_size = 1
++    total_num_tokens_across_dp = [sum(split_config.num_tokens_padded)]
++    
++    return (
++        [
++            UBatchSlice(
++                request_slice=slice(
++                    split_config.batch_indices[i],
++                    split_config.batch_indices[i + 1],
++                ),
++                token_slice=slice(
++                    split_config.split_indices[i],
++                    split_config.split_indices[i + 1],
++                ),
++            )
++            for i in range(split_config.num_nano_batches)
++        ],
++        torch.tensor(
++            total_num_tokens_across_dp,
++            device="cpu",
++            dtype=torch.int32,
++        )
++    )
++    
++    
+\ No newline at end of file
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2f992ce..d3c25e6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -507,6 +507,11 @@ class ServerArgs:
+     enable_pdmux: bool = False
+     pdmux_config_path: Optional[str] = None
+     sm_group_num: int = 8
++    
++    # For schedflow
++    enable_nano_batch_split: bool = False
++    min_nano_split_tokens: int = 1024
++    max_num_nano_batches: int = 2
+ 
+     def get_attention_backends(server_args):
+         prefill_attention_backend_str = (
+@@ -3258,6 +3263,26 @@ class ServerArgs:
+             default=ServerArgs.sm_group_num,
+             help="Number of sm partition groups.",
+         )
++        
++        # For schedflow
++        parser.add_argument(
++            "--enable-nano-batch-split",
++            action="store_true",
++            help="Enable nano batch split within a micro batch for schedflow.",
++        )
++        parser.add_argument(
++            "--min-nano-split-tokens",
++            type=int,
++            default=ServerArgs.min_nano_split_tokens,
++            help="Minimum number of tokens to split the input batch",
++        )
++        parser.add_argument(
++            "--max-num-nano-batches",
++            type=int,
++            default=ServerArgs.max_num_nano_batches,
++            help="Maximum number of nano-batches to split the input batch into",
++        )
++            
+ 
+         # For deterministic inference
+         parser.add_argument(
+diff --git a/python/sglang/srt/utils/ubatch_utils.py b/python/sglang/srt/utils/ubatch_utils.py
+new file mode 100644
+index 0000000..4daff5d
+--- /dev/null
++++ b/python/sglang/srt/utils/ubatch_utils.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# [jbluo] Copied from vLLM
++
++from dataclasses import dataclass
++
++from typing_extensions import TypeAlias
++
++
++@dataclass
++class UBatchSlice:
++    request_slice: slice
++    token_slice: slice
++
++    def is_empty(self) -> bool:
++        return (
++            self.request_slice.start == self.request_slice.stop
++            or self.token_slice.start == self.token_slice.stop
++        )
++        
++    @property
++    def num_requests(self) -> int:
++        return self.request_slice.stop - self.request_slice.start
++
++    @property
++    def num_tokens(self) -> int:
++        return self.token_slice.stop - self.token_slice.start
++
++
++UBatchSlices: TypeAlias = list[UBatchSlice]
++
++
++def is_second_ubatch_empty(
++    orig_num_tokens_per_ubatch: int, padded_num_tokens_per_ubatch: int
++) -> bool:
++    return padded_num_tokens_per_ubatch >= 2 * orig_num_tokens_per_ubatch

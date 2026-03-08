@@ -52,13 +52,19 @@ class OperatorHandle:
 
     Attributes:
         module_name: Name of the FX submodule corresponding to the operator.
-        nano_batch_idx: Nano-batch index that this operator belongs to.
+        batch_idx: Batch index that this operator belongs to.
+        batch_size: Number of tokens in the operator's batch.
         tag: A set of tags describing operator properties (e.g., "network").
     """
 
     module_name: str
-    nano_batch_idx: int
+    batch_idx: int
+    batch_size: int
     tag: set[str]
+    
+    # Below are attributes for execution backend
+    _is_dryrun: bool
+    _use_cudagraph: bool
 
 
 class ExecutionContext:
@@ -96,9 +102,9 @@ class ExecutionContext:
     def split_config(self) -> SplitConfig:
         return self._split_config
 
-    async def pop(self, nano_batch_idx: int) -> OperatorHandle:
+    async def pop(self, batch_idx: int) -> OperatorHandle:
         """Wait for and return the next ready operator for a nano-batch."""
-        return await self._op_queue[nano_batch_idx].get()
+        return await self._op_queue[batch_idx].get()
 
     async def execute(
         self,
@@ -116,9 +122,7 @@ class ExecutionContext:
 
 
 class OpSchedulerBase(ABC):
-    def __init__(
-        self, config: "OpSchedulerConfigBase", policy_name: str | None = None
-    ) -> None:
+    def __init__(self, policy_name: str | None = None) -> None:
         self.policy_name = policy_name
 
     @abstractmethod
@@ -146,8 +150,3 @@ class OpSchedulerBase(ABC):
         pass
 
 
-class OpSchedulerConfigBase(ABC):
-    @classmethod
-    @abstractmethod
-    def get_scheduler_cls(cls) -> type[OpSchedulerBase]:
-        pass

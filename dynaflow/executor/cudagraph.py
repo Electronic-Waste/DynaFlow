@@ -4,7 +4,8 @@ from typing import Any
 import torch
 
 from dynaflow.config import CUDAGraphConfig
-from dynaflow.context import get_forward_context
+from dynaflow.interface import OperatorHandle
+from dynaflow.runtime.env import get_op_handle
 
 
 class CUDAGraphPool:
@@ -14,9 +15,12 @@ class CUDAGraphPool:
     def get_pool(self, key: int) -> tuple[int, int]:
         # NOTE(yi): the following lines are for vLLM only.
         # Change this in other systems to set the graph pool for NCCL
-        from vllm.distributed.device_communicators.pynccl_allocator import (
-            set_graph_pool_id,
-        )
+        try:
+            from vllm.distributed.device_communicators.pynccl_allocator import (
+                set_graph_pool_id,
+            )
+        except ImportError:
+            set_graph_pool_id = lambda pool: None
 
         if key not in self.pools:
             # Create a new CUDA graph pool for this nano-batch key
@@ -79,25 +83,21 @@ class CUDAGraphWrapper:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Execute or replay the captured CUDA Graph for matching inputs."""
-        forward_context = get_forward_context()
-        size = forward_context.num_tokens_padded[0]
-        if (
-            not forward_context.use_cudagraph
-            or len(forward_context.nano_batch_idx) != 1
-            or size not in self.config.capture_sizes
-        ):
-            # Not capturing or size not selected: run eagerly
+        op_handle = get_op_handle()
+        if not isinstance(op_handle, OperatorHandle) or not op_handle._use_cudagraph:
             return self.runnable(*args, **kwargs)
 
+        size = op_handle.batch_size
         key = (
             size,
-            forward_context.nano_batch_idx[0],
-            forward_context.num_tokens_padded,
+            op_handle.batch_idx,
+            op_handle.batch_size,
         )
         entry = self._entries.get(key)
         if entry is None:
-            assert forward_context.is_dryrun
-            pool = _global_pool.get_pool(forward_context.nano_batch_idx[0])
+            assert op_handle._is_dryrun, \
+                f"CUDA graph capture is required for batch size {size} but not in dry-run mode"
+            pool = _global_pool.get_pool(op_handle.batch_idx)
             cudagraph = torch.cuda.CUDAGraph()
             input_addresses = [
                 a.data_ptr() for a in args if isinstance(a, torch.Tensor)
@@ -116,7 +116,7 @@ class CUDAGraphWrapper:
             new_addrs = [a.data_ptr() for a in args if isinstance(a, torch.Tensor)]
             if new_addrs != entry.get("inputs", new_addrs):
                 raise RuntimeError(
-                    "CUDAGraph input addresses changed between capture and " "replay"
+                    "CUDAGraph input addresses changed between capture and replay"
                 )
         entry["graph"].replay()
         # Replay returns buffered outputs (weak-ref'ed) captured earlier

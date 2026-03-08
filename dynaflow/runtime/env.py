@@ -1,6 +1,10 @@
 from typing import Any
 
 import torch
+from collections.abc import Generator
+from contextlib import contextmanager
+
+from dynaflow.interface import OperatorHandle
 
 
 class ActivationBuffer:
@@ -28,15 +32,39 @@ class ExecutionEnvironment:
 
     def put(
         self,
-        nano_batch_idx: int,
+        batch_idx: int,
         node: torch.fx.Node,
         data: Any,
     ) -> None:
         """Store a node's result alongside a reference count of its users."""
-        self.env[nano_batch_idx][node] = ActivationBuffer(data, len(node.users))
+        self.env[batch_idx][node] = ActivationBuffer(data, len(node.users))
 
-    def get(self, nano_batch_idx: int, node: torch.fx.Node) -> Any:
+    def get(self, batch_idx: int, node: torch.fx.Node) -> Any:
         """Retrieve and decrement the reference count; clear when last use."""
-        buffer = self.env[nano_batch_idx][node].get_ref()
+        buffer = self.env[batch_idx][node].get_ref()
         assert buffer is not None
         return buffer
+
+_current_op_handle: OperatorHandle | tuple[OperatorHandle] | None = None
+
+def get_op_handle() -> OperatorHandle | tuple[OperatorHandle]:
+    """Return the current operator handle.
+
+    Must be used inside regions established by `set_operator_handle`.
+    """
+    assert _current_op_handle is not None
+    return _current_op_handle
+
+
+@contextmanager
+def set_op_handle(
+    handle: OperatorHandle | tuple[OperatorHandle]
+) -> Generator[None, None, None]:
+    """Set the current operator handle for the duration of the context."""
+    global _current_op_handle
+    prev_handle = _current_op_handle
+    _current_op_handle = handle
+    try:
+        yield
+    finally:
+        _current_op_handle = prev_handle
