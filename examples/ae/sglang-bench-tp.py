@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import subprocess
 import argparse
@@ -9,11 +10,9 @@ model_name_to_short_name = {
 }
 
 strategy_name_to_config = {
-    "nanoflow": "{\"scheduler_path\": \"../scheduler/vllm/nanoflow.py:NanoFlowScheduler\","
+    "nanoflow": "{\"scheduler_path\": \"../scheduler/sglang/nanoflow.py:NanoFlowScheduler\","
                 "\"use_inductor\": false, \"min_nano_split_tokens\": 4096,"
-                "\"max_num_splits\": 2,\"use_ar_norm_fusion\": true}",
-    "tokenweave": "{\"scheduler_path\": \"../scheduler/vllm/tokenweave.py:TokenWeaveScheduler\","
-                  "\"use_inductor\": false, \"min_nano_split_tokens\": 4096, \"max_num_splits\": 2}",
+                "\"max_num_splits\": 2}",
 }
 
 def create_parser():
@@ -33,13 +32,9 @@ def main():
     tp_size = int(args.tp_size)
     mode = str(args.mode)
     strategy = str(args.strategy) if args.strategy else "none"
-    testsuite_name = f"vllm_{strategy}/{model_short_name}" if strategy != "none" else f"vllm/{model_short_name}"
+    testsuite_name = f"sglang_{strategy}/{model_short_name}" if strategy != "none" else f"sglang/{model_short_name}"
     dirname = f"../results/{testsuite_name}"
     os.makedirs(f"{dirname}/log", exist_ok=True)
-
-    env = os.environ.copy()
-    env["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-    env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
 
     if mode == "fixed":
         input_output_lengths = [
@@ -54,23 +49,20 @@ def main():
                                 f"input{input_len}_output{output_len}_iter{i}"
                 with open(f"{dirname}/log/{testcase_name}.log", "w") as f:
                     command = [
-                            "vllm", "bench", "throughput",
-                            "--model", model_name,
-                            "--tensor-parallel-size", str(tp_size),
-                            "--num-prompts", "1024",
-                            "--n", "1",
-                            "--input-len", str(input_len),
-                            "--output-len", str(output_len),
-                            "--compilation-config", f"{{\"cudagraph_mode\": \"NONE\"}}",
+                            "python", "-m", "sglang.bench_offline_throughput",
+                            "--model-path", model_name,
+                            "--tp-size", str(tp_size),
+                            "--dataset-name", "random",
+                            "--random-input-len", str(input_len),
+                            "--random-output-len", str(output_len),
+                            "--attention-backend", "triton",
+                            "--enable-piecewise-cuda-graph",
+                            "--result-filename", f"{dirname}/{testcase_name}.json",
                             "--dynaflow-config" if strategy != "none" else "",
                             f"{strategy_name_to_config[strategy]}" if strategy != "none" else "",
-                            f"--output-json", f"{dirname}/{testcase_name}.json",
                         ]
                     print(f"Running command: {' '.join(command)}")
-                    subprocess.run(command, env=env, check=True, stdout=f, stderr=subprocess.STDOUT)
-        
-
-
+                    subprocess.run(command, check=True, stdout=f, stderr=subprocess.STDOUT)
 
 
 if __name__ == "__main__":

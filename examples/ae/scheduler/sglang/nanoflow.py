@@ -3,6 +3,10 @@ import itertools
 import torch
 from typing_extensions import override
 
+# NOTE(yi): the following line is for SGLang only.
+# Change this in other systems
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context as get_sglang_forward_context, replace_forward_context as replace_sglang_forward_context
+
 from dynaflow.config import DynaFlowConfig
 from dynaflow.interface import (
     ExecutionContext,
@@ -18,7 +22,7 @@ class NanoFlowScheduler(OpSchedulerBase):
     """Simple scheduler that overlaps network and compute when possible."""
 
     def __init__(self, config: DynaFlowConfig) -> None:
-        super().__init__(policy_name="nanoflow")
+        super().__init__("nanoflow")
         additional = config.additional_config
         self.min_nano_split_tokens = additional["min_nano_split_tokens"]
         self.max_num_nano_batches = config.max_num_splits
@@ -26,40 +30,20 @@ class NanoFlowScheduler(OpSchedulerBase):
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
 
-        def _is_all_reduce(node_list: list[torch.fx.Node], start_idx: int) -> bool:
-            suppress_tokens = {"gate_proj", "up_proj", "q_proj", "k_proj", "v_proj"}
-            idx = start_idx - 1
-            while idx >= 0:
-                node = node_list[idx]
-                if (
-                    node.op != "call_function"
-                    or not callable(node.target)
-                    or node.target.__name__ != "linear"
-                ):
-                    idx -= 1
-                    continue
-                for a in node.args:
-                    if a is not None and any(tok in str(a) for tok in suppress_tokens):
-                        return False
-                break
-            return True
-
-        self.is_all_reduce = _is_all_reduce
-
     @override
     def get_split_rules(self) -> list[MatchingRule]:
         return [
-            MatchingRule(
-                condition=Op(pattern=r"prim_redistribute"), hook=self.is_all_reduce
-            ),
+            MatchingRule(condition=Op(pattern=r"inplace_all_reduce|outplace_all_reduce")),
+            # NOTE(yi): attention operators should be split
+            # when using cudagraph
+            # MatchingRule(condition=Op(pattern=r"unified_attention.*")),
         ]
 
     @override
     def get_tag_rules(self) -> dict[MatchingRule, set[str]]:
         return {
-            MatchingRule(
-                condition=Op(pattern=r"prim_redistribute"), hook=self.is_all_reduce
-            ): {"network"},
+            MatchingRule(condition=Op(pattern=r"inplace_all_reduce|outplace_all_reduce")): {"network"},
+            # MatchingRule(condition=Op(pattern=r"unified_attention.*")): {"attention", "no-cudagraph"},
         }
 
     @override
@@ -68,7 +52,6 @@ class NanoFlowScheduler(OpSchedulerBase):
         input_info: InputInfo,
         use_cudagraph: bool,
     ) -> SplitConfig:
-        assert self.cudagraph_capture_sizes
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
         mid = min(
             range(len(prefix_sum)),
@@ -123,9 +106,8 @@ class NanoFlowScheduler(OpSchedulerBase):
     async def schedule(self, context: ExecutionContext) -> None:
         num_batches = context.split_config.num_nano_batches
         batch_indices = list(range(num_batches))
-        # ctx = get_vllm_forward_context()
-        # attn_metadata_list = ctx.attn_metadata
-        # assert isinstance(attn_metadata_list, list)
+        fwd_ctx = get_sglang_forward_context()
+        assert fwd_ctx is not None and fwd_ctx.ubatch_contexts is not None
 
         while batch_indices:
             ops = []
@@ -141,6 +123,8 @@ class NanoFlowScheduler(OpSchedulerBase):
                     stream = self.comm_stream
                 else:
                     stream = self.comp_stream
-                # ctx.attn_metadata = attn_metadata_list[batch_idx]
+
+                replace_sglang_forward_context(fwd_ctx.ubatch_contexts[batch_idx])
+
                 with torch.cuda.stream(stream):
                     await context.execute((op,))

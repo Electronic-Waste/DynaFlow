@@ -157,7 +157,7 @@ class TokenWeaveScheduler(OpSchedulerBase):
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:
-                num_tokens_padded = pack_tokens(
+                num_tokens_padded, use_cudagraph = pack_tokens(
                     prefix_sum[-1], self.cudagraph_capture_sizes
                 )
             return SplitConfig(
@@ -176,10 +176,14 @@ class TokenWeaveScheduler(OpSchedulerBase):
                 prefix_sum[-1] - prefix_sum[mid],
             ]
             if use_cudagraph:
-                num_tokens_padded = [
+                cudagraph_pack_results = [
                     pack_tokens(num_tokens, self.cudagraph_capture_sizes)
                     for num_tokens in num_tokens_padded
                 ]
+                if all(use for _, use in cudagraph_pack_results):
+                    num_tokens_padded = [padded for padded, _ in cudagraph_pack_results]
+                else:
+                    use_cudagraph = False
             return SplitConfig(
                 num_nano_batches=2,
                 batch_sizes=[mid, input_info.batch_size - mid],

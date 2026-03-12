@@ -8,7 +8,7 @@ class CUDAGraphConfig:
     enabled: bool
     capture_sizes: list[int]
     weak_ref_output: bool = True
-    check_ptr_consistency: bool = False
+    check_ptr_consistency: bool = True
 
 
 @dataclass

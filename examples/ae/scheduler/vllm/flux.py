@@ -120,7 +120,7 @@ class FluxScheduler(OpSchedulerBase):
         prefix_sum = [0] + list(itertools.accumulate(input_info.num_tokens))
         num_tokens_padded = prefix_sum[-1]
         if use_cudagraph:
-            num_tokens_padded = pack_tokens(
+            num_tokens_padded, use_cudagraph = pack_tokens(
                 prefix_sum[-1], self.cudagraph_capture_sizes
             )
         return SplitConfig(

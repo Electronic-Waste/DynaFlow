@@ -12,6 +12,7 @@ from vllm.forward_context import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 
+from dynaflow.config import DynaFlowConfig
 from dynaflow.interface import (
     ExecutionContext,
     InputInfo,
@@ -31,20 +32,13 @@ class DBOScheduler(OpSchedulerBase):
     dispatch/communication, and expert compute.
     """
 
-    def __init__(
-        self,
-        *,
-        min_nano_split_tokens: int,
-        max_num_nano_batches: int,
-        use_reduce_norm_fusion: bool,
-        cudagraph_capture_sizes: list[int],
-        **kwargs,
-    ) -> None:
+    def __init__(self, config: DynaFlowConfig) -> None:
         super().__init__(policy_name="dbo")
-        self.min_nano_split_tokens = min_nano_split_tokens
-        self.max_num_nano_batches = max_num_nano_batches
-        self.use_reduce_norm_fusion = use_reduce_norm_fusion
-        self.cudagraph_capture_sizes = cudagraph_capture_sizes
+        additional = config.additional_config
+        self.min_nano_split_tokens = additional["min_nano_split_tokens"]
+        self.max_num_nano_batches = config.max_num_splits
+        self.use_reduce_norm_fusion = additional.get("use_reduce_norm_fusion", False)
+        self.cudagraph_capture_sizes = config.cudagraph_config.capture_sizes
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
         self.dp_metadata: list[DPMetadata] | None = None
@@ -115,7 +109,7 @@ class DBOScheduler(OpSchedulerBase):
         ):
             num_tokens_padded = prefix_sum[-1]
             if use_cudagraph:
-                num_tokens_padded = pack_tokens(
+                num_tokens_padded, use_cudagraph = pack_tokens(
                     prefix_sum[-1], self.cudagraph_capture_sizes
                 )
             return SplitConfig(
@@ -134,10 +128,14 @@ class DBOScheduler(OpSchedulerBase):
                 prefix_sum[-1] - prefix_sum[mid],
             ]
             if use_cudagraph:
-                num_tokens_padded = [
+                cudagraph_pack_results = [
                     pack_tokens(num_tokens, self.cudagraph_capture_sizes)
                     for num_tokens in num_tokens_padded
                 ]
+                if all(use for _, use in cudagraph_pack_results):
+                    num_tokens_padded = [padded for padded, _ in cudagraph_pack_results]
+                else:
+                    use_cudagraph = False
             return SplitConfig(
                 num_nano_batches=2,
                 batch_sizes=[mid, input_info.batch_size - mid],

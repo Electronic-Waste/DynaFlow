@@ -446,9 +446,6 @@ class DynaFlowEngine:
             if isinstance(example_value, torch.Tensor):
                 if isinstance(example_value.shape[0], torch.SymInt):
                     if split_config.use_cudagraph:
-                        print(f"Copying input tensor of shape {args[placeholder_idx].shape} into static buffer for batch {batch_idx}, placeholder {placeholder_idx}, num_tokens {num_tokens}")
-                        import sys
-                        sys.stdout.flush()
                         assert self.input_buffers is not None
                         assert (
                             self.input_buffers[batch_idx].get(placeholder_idx)

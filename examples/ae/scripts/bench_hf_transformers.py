@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import os
 from collections.abc import Callable
 from typing import Any
@@ -7,14 +8,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 
 from dynaflow.config import CUDAGraphConfig, DynaFlowConfig, InductorConfig
-from dynaflow.example.hf.nanoflow import (
-    NanoFlowScheduler,
-    NanoFlowSchedulerConfig,
-)
 from dynaflow.interface import SplitConfig
 from dynaflow.manager import DynaFlowManager
 
-_scheduler = None
 _manager = DynaFlowManager()
 
 
@@ -31,35 +27,32 @@ def dynaflow_backend(
     if not any(isinstance(i, torch.SymInt) for i in example_inputs):
         return gm
 
-    global _scheduler
-    assert _scheduler is None
-    _scheduler = NanoFlowScheduler(
-        NanoFlowSchedulerConfig(
-            min_nano_split_tokens=64,
-            max_num_nano_batches=2,
-            cudagraph_capture_sizes=[64, 128, 256],
-        )
+    _sched_file = os.path.join(
+        os.path.dirname(__file__),
+        '..', 'scheduler', 'hf', 'nanoflow.py',
     )
-    inductor_cfg = InductorConfig(
-        enabled=True,
-        compile_sizes=set(),
-    )
-    cudagraph_cfg = CUDAGraphConfig(
-        enabled=False,
-        capture_sizes=[64, 128, 256],
-    )
+    inductor_cfg = InductorConfig(enabled=True, compile_sizes=set())
+    cudagraph_cfg = CUDAGraphConfig(enabled=False, capture_sizes=[64, 128, 256])
     dynaflow_cfg = DynaFlowConfig(
-        max_num_nano_batches=2,
-        min_nano_split_tokens=1,
+        scheduler_path=_sched_file + ':NanoFlowScheduler',
+        max_num_splits=2,
         inductor_config=inductor_cfg,
         cudagraph_config=cudagraph_cfg,
+        additional_config={"min_nano_split_tokens": 64},
     )
+
+    file_path, cls_name = dynaflow_cfg.scheduler_path.split(':', 1)
+    spec = importlib.util.spec_from_file_location('_dynaflow_scheduler', file_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    scheduler = getattr(module, cls_name)(dynaflow_cfg)
 
     global _manager
     _manager.initialize(
         graph_module=gm,
         config=dynaflow_cfg,
-        scheduler=_scheduler,
+        scheduler=scheduler,
         example_inputs=list(example_inputs),
     )
     return _manager.get_callable()
@@ -238,12 +231,12 @@ def main():
     else:
         split_config = None
 
-    # avg, std = run_inference(
-    #   model, inputs, split_config, warmup_steps=10, trials=10
-    # )
-    avg, std = run_training(
-        model, inputs, split_config, warmup_steps=10, trials=10
+    avg, std = run_inference(
+      model, inputs, split_config, warmup_steps=10, trials=10
     )
+    # avg, std = run_training(
+    #     model, inputs, split_config, warmup_steps=10, trials=10
+    # )
     print(f"Average latency: {avg:.2f} ms, Standard deviation: {std:.2f} ms")
     # run_fwd_bwd_test(model, inputs)
 
