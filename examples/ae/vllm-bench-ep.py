@@ -98,12 +98,14 @@ def main():
                         '{"cudagraph_mode": "NONE"}',
                         "--output-json",
                         f"{dirname}/{testcase_name}.json",
+                        "--enable-expert-parallel",
                     ]
                     
                     if strategy == "dbo":
                         command += ["--dynaflow-config", f"{strategy_name_to_config[strategy]}"]
                     elif strategy == "native-dbo":
                         command += ["--enable-dbo"]
+                    print(f"Running command: {' '.join(command)}")
                     subprocess.run(
                         command, env=env, check=True, stdout=f, stderr=subprocess.STDOUT
                     )
