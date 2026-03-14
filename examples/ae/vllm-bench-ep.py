@@ -4,7 +4,6 @@ import argparse
 
 model_name_to_short_name = {
     "deepseek-ai/DeepSeek-V2-Lite": "deepseek_v2_lite",
-    "deepseek-ai/DeepSeek-V3": "deepseek_v3",
 }
 
 strategy_name_to_config = {
