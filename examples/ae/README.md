@@ -69,7 +69,8 @@ cd sglang
 git reset --hard d6fee73d1f593bd6754cd2550775fd2e54aeae60
 git apply ../patch/sglang.patch
 uv venv && source .venv/bin/activate
-uv pip install -e "python"
+uv pip install -e "python" --prerealase=allow
+uv pip install transformers==4.57.6 flashinfer-python
 # Build DynaFlow
 uv pip install -e "../../../"
 ```

@@ -465,6 +465,101 @@ index 9d3b9eb5e..7e1b19e92 100644
  
      def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
          N = tgt_loc.numel()
+diff --git a/python/sglang/srt/model_executor/dynaflow.py b/python/sglang/srt/model_executor/dynaflow.py
+new file mode 100644
+index 000000000..b04e84cba
+--- /dev/null
++++ b/python/sglang/srt/model_executor/dynaflow.py
+@@ -0,0 +1,89 @@
++import importlib.util
++from typing import TYPE_CHECKING, Any, Optional
++
++import torch
++
++from dynaflow.config import DynaFlowConfig
++from dynaflow.interface import OpSchedulerBase, SplitConfig
++from dynaflow.manager import DynaFlowManager
++
++from sglang.srt.utils.ubatch_utils import UBatchSlice, UBatchSlices
++
++import logging
++logger = logging.getLogger(__name__)
++
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++
++
++_manager = DynaFlowManager()
++_scheduler: Optional[OpSchedulerBase] = None
++
++
++def get_manager(
++    graph_module: torch.fx.GraphModule,
++    config: DynaFlowConfig,
++    example_inputs: list[Any],
++) -> DynaFlowManager:
++    global _manager, _scheduler
++
++    file_path, cls_name = config.scheduler_path.split(":", 1)
++    spec = importlib.util.spec_from_file_location("_dynaflow_scheduler", file_path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    scheduler_cls = getattr(module, cls_name)
++    _scheduler = scheduler_cls(config)
++    _manager.initialize(graph_module, config, _scheduler, example_inputs)
++    return _manager
++
++
++def nano_ubatch_split(
++    batch: "ForwardBatch",
++    is_dummy_run: bool = False,
++    use_cudagraph: bool = False,
++) -> tuple[UBatchSlices, torch.Tensor]:
++    """
++    Prepare UBatch-compatible nano-batch slices for a SGLang ForwardBatch.
++
++    Calls manager.prepare() to decide if splitting is beneficial, then returns
++    a list of UBatchSlice objects with request and token slices.
++    """
++    batch_size = batch.batch_size
++    if batch.forward_mode.is_extend():
++        num_tokens = batch.extend_seq_lens.tolist()
++    elif batch.forward_mode.is_decode():
++        num_tokens = [1] * batch.input_ids.shape[0]
++    else:
++        raise ValueError(f"DynaFlow: unsupported forward mode: {batch.forward_mode}")
++
++    split_config = _manager.prepare(
++        batch_size,
++        num_tokens=num_tokens,
++        is_dryrun=is_dummy_run,
++        use_cudagraph=use_cudagraph,
++    )
++
++    total_num_tokens_across_dp = [sum(split_config.num_tokens_padded)]
++
++    return (
++        [
++            UBatchSlice(
++                request_slice=slice(
++                    split_config.batch_indices[i],
++                    split_config.batch_indices[i + 1],
++                ),
++                token_slice=slice(
++                    split_config.split_indices[i],
++                    split_config.split_indices[i + 1],
++                ),
++            )
++            for i in range(split_config.num_nano_batches)
++        ],
++        torch.tensor(
++            total_num_tokens_across_dp,
++            device="cpu",
++            dtype=torch.int32,
++        ),
++    )
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
 index 03d24cc88..f9e542c11 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
@@ -770,3 +865,46 @@ index 2f992cecd..6732539da 100644
  
          # For deterministic inference
          parser.add_argument(
+diff --git a/python/sglang/srt/utils/ubatch_utils.py b/python/sglang/srt/utils/ubatch_utils.py
+new file mode 100644
+index 000000000..4daff5d6f
+--- /dev/null
++++ b/python/sglang/srt/utils/ubatch_utils.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# [jbluo] Copied from vLLM
++
++from dataclasses import dataclass
++
++from typing_extensions import TypeAlias
++
++
++@dataclass
++class UBatchSlice:
++    request_slice: slice
++    token_slice: slice
++
++    def is_empty(self) -> bool:
++        return (
++            self.request_slice.start == self.request_slice.stop
++            or self.token_slice.start == self.token_slice.stop
++        )
++        
++    @property
++    def num_requests(self) -> int:
++        return self.request_slice.stop - self.request_slice.start
++
++    @property
++    def num_tokens(self) -> int:
++        return self.token_slice.stop - self.token_slice.start
++
++
++UBatchSlices: TypeAlias = list[UBatchSlice]
++
++
++def is_second_ubatch_empty(
++    orig_num_tokens_per_ubatch: int, padded_num_tokens_per_ubatch: int
++) -> bool:
++    return padded_num_tokens_per_ubatch >= 2 * orig_num_tokens_per_ubatch
