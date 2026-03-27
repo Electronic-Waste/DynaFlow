@@ -13,6 +13,12 @@ strategy_name_to_config = {
     "nanoflow": "{\"scheduler_path\": \"../scheduler/sglang/nanoflow.py:NanoFlowScheduler\","
                 "\"use_inductor\": false, \"min_nano_split_tokens\": 4096,"
                 "\"max_num_splits\": 2}",
+    "none": "{\"scheduler_path\": \"../scheduler/sglang/nanoflow.py:NanoFlowScheduler\","
+            "\"use_inductor\": false, \"min_nano_split_tokens\": 100000000,"
+            "\"max_num_splits\": 2}",
+    "all_split": "{\"scheduler_path\": \"../scheduler/sglang/nanoflow.py:NanoFlowScheduler\","
+                 "\"use_inductor\": false, \"min_nano_split_tokens\": 1,"
+                 "\"max_num_splits\": 2}",
 }
 
 def create_parser():
@@ -58,11 +64,39 @@ def main():
                             "--attention-backend", "triton",
                             "--enable-piecewise-cuda-graph",
                             "--result-filename", f"{dirname}/{testcase_name}.json",
-                            "--dynaflow-config" if strategy != "none" else "",
-                            f"{strategy_name_to_config[strategy]}" if strategy != "none" else "",
+                            *(["--dynaflow-config", strategy_name_to_config[strategy]]
+                              if strategy != "none" else []),
                         ]
                     print(f"Running command: {' '.join(command)}")
                     subprocess.run(command, check=True, stdout=f, stderr=subprocess.STDOUT)
+
+
+    elif mode == "dataset":
+        basedir = os.path.expanduser("~/.cache/dynaflow/eval_datasets")
+        dataset_paths = {
+            "sharegpt":  os.path.join(basedir, "sharegpt.json"),
+            "lmsys":     os.path.join(basedir, "lmsys.json"),
+            "splitwise": os.path.join(basedir, "splitwise.json"),
+        }
+        for dataset_label, dataset_path in dataset_paths.items():
+            for i in range(10):
+                testcase_name = f"{model_short_name}_tp_{tp_size}_{dataset_label}_iter{i}"
+                with open(f"{dirname}/log/{testcase_name}.log", "w") as f:
+                    command = [
+                        "python", "-m", "sglang.bench_offline_throughput",
+                        "--model-path", model_name,
+                        "--tp-size", str(tp_size),
+                        "--dataset-name", "sharegpt",
+                        "--dataset-path", dataset_path,
+                        "--attention-backend", "triton",
+                        "--enable-piecewise-cuda-graph",
+                        "--result-filename", f"{dirname}/{testcase_name}.json",
+                        *(["--dynaflow-config", strategy_name_to_config[strategy]]
+                          if strategy != "none" else []),
+                    ]
+                    print(f"Running command: {' '.join(command)}")
+                    subprocess.run(command, check=True,
+                                   stdout=f, stderr=subprocess.STDOUT)
 
 
 if __name__ == "__main__":

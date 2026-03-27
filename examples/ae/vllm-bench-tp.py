@@ -64,15 +64,41 @@ def main():
                             "--input-len", str(input_len),
                             "--output-len", str(output_len),
                             "--compilation-config", f"{{\"cudagraph_mode\": \"NONE\"}}",
-                            "--dynaflow-config" if strategy != "none" else "",
-                            f"{strategy_name_to_config[strategy]}" if strategy != "none" else "",
-                            f"--output-json", f"{dirname}/{testcase_name}.json",
+                            *(["--dynaflow-config", strategy_name_to_config[strategy]]
+                              if strategy != "none" else []),
+                            "--output-json", f"{dirname}/{testcase_name}.json",
                         ]
                     print(f"Running command: {' '.join(command)}")
                     subprocess.run(command, env=env, check=True, stdout=f, stderr=subprocess.STDOUT)
-        
-
-
+    elif mode == "dataset":
+        basedir = os.path.expanduser("~/.cache/dynaflow/eval_datasets")
+        dataset_paths = {
+            "sharegpt":  os.path.join(basedir, "sharegpt.json"),
+            "lmsys":     os.path.join(basedir, "lmsys.json"),
+            "splitwise": os.path.join(basedir, "splitwise.json"),
+        }
+        for dataset_label, dataset_path in dataset_paths.items():
+            for i in range(10):
+                testcase_name = f"{model_short_name}_tp_{tp_size}_{dataset_label}_iter{i}"
+                with open(f"{dirname}/log/{testcase_name}.log", "w") as f:
+                    command = [
+                        "vllm", "bench", "throughput",
+                        "--model", model_name,
+                        "--tensor-parallel-size", str(tp_size),
+                        "--dataset-name", "sharegpt",
+                        "--dataset-path", dataset_path,
+                        "--num-prompts", "8192",
+                        "--n", "1",
+                        "--gpu-memory-utilization", "0.9",
+                        "--max-num-seqs", "4096",
+                        "--compilation-config", "{\"cudagraph_mode\": \"NONE\"}",
+                        *(["--dynaflow-config", strategy_name_to_config[strategy]]
+                          if strategy != "none" else []),
+                        "--output-json", f"{dirname}/{testcase_name}.json",
+                    ]
+                    print(f"Running command: {' '.join(command)}")
+                    subprocess.run(command, env=env, check=True,
+                                   stdout=f, stderr=subprocess.STDOUT)
 
 
 if __name__ == "__main__":

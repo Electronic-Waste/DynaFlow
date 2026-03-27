@@ -75,15 +75,19 @@ uv pip install transformers==4.57.6 flashinfer-python
 uv pip install -e "../../../"
 ```
 
-After installing the frameworks, you can download the required models in any of the created virtual environments.
+After installing the frameworks, you can download the required models and datasets via the following commands.
 
 ```bash
-source vllm/.venv/bin/activate
-huggingface-cli login # Log in with your HuggingFace account to access the models
-huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct
-huggingface-cli download meta-llama/Meta-Llama-3-70B-Instruct
-huggingface-cli download Qwen/Qwen2.5-72B-Instruct
-huggingface-cli download deepseek-ai/DeepSeek-V2-Lite
+uv venv && source .venv/bin/activate
+uv pip install huggingface_hub datasets
+hf auth login # Log in with your HuggingFace account to access the models
+python scripts/preprocess_datasets.py
+hf download meta-llama/Meta-Llama-3-8B-Instruct
+hf download meta-llama/Meta-Llama-3-70B-Instruct
+hf download Qwen/Qwen2.5-72B-Instruct
+hf download deepseek-ai/DeepSeek-V2-Lite
+hf download deepseek-ai/DeepSeek-V3
+hf download stepfun-ai/stepvideo-t2v --local-dir ~/.cache/dynaflow/eval_models/stepvideo
 ```
 
 ## Benchmark
@@ -91,7 +95,6 @@ huggingface-cli download deepseek-ai/DeepSeek-V2-Lite
 After installing the frameworks, you can run the benchmarks for each target. Each target has a corresponding Makefile rule that runs the benchmarks for all models and datasets.
 
 ```bash
-
 make vllm-nanoflow # Figure 9
 make sglang-nanoflow # Figure 10
 make vllm-dbo # Figure 12

@@ -10,7 +10,7 @@ strategy_name_to_config = {
     "dbo": '{"scheduler_path": "../scheduler/vllm/dbo.py:DBOScheduler",'
     '"use_inductor": true, "min_nano_split_tokens": 2048,'
     '"max_num_splits": 2}',
-    'native_dbo': '',
+    'original_dbo': '',
 }
 
 
@@ -102,7 +102,7 @@ def main():
                     
                     if strategy == "dbo":
                         command += ["--dynaflow-config", f"{strategy_name_to_config[strategy]}"]
-                    elif strategy == "native-dbo":
+                    elif strategy == "original_dbo":
                         command += ["--enable-dbo"]
                     print(f"Running command: {' '.join(command)}")
                     subprocess.run(
