@@ -44,6 +44,12 @@ class SplitConfig:
     """Whether this is a dry run."""
     use_cudagraph: bool
     """Whether to use CUDA graph."""
+    allow_fallback: bool = True
+    """Allow fast-path fallback for single nano-batch execution.
+    When True (default), single nano-batch bypasses the scheduler and
+    runs the graph module directly.  Set to False to force
+    scheduler-driven execution (e.g. when the scheduler substitutes
+    ops via custom funcs)."""
 
 
 @dataclass(eq=False, frozen=True)

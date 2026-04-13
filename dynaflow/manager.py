@@ -177,6 +177,7 @@ class DynaFlowManager:
             if (
                 not self.cached_config.is_dryrun
                 and self.cached_config.num_nano_batches == 1
+                and self.cached_config.allow_fallback
             ):
                 assert self.engine is not None
                 result = self.engine.execute_single_batch(self.cached_config, args, kwargs)
