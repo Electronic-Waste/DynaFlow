@@ -1,18 +1,12 @@
 import itertools
 from typing import Any
 
+import flux
 import torch
-import triton
-from triton_dist.kernels.nvidia import (
-    create_gemm_ar_context,
-    gemm_allreduce_op,
-)
-from triton_dist.utils import (
-    init_nvshmem_by_torch_process_group,
-    nvshmem_barrier_all_on_stream,
-)
 from typing_extensions import override
 from vllm.distributed.parallel_state import get_tp_group
+
+from dynaflow.config import DynaFlowConfig
 
 # NOTE(yi): the following line is for vLLM only.
 # Change this in other systems
@@ -30,65 +24,57 @@ from dynaflow.utils import pack_tokens
 
 
 class FluxScheduler(OpSchedulerBase):
-    def __init__(self, *, cudagraph_capture_sizes: list[int], **kwargs) -> None:
+    def __init__(self, config: DynaFlowConfig) -> None:
         super().__init__(policy_name="flux")
-        self.cudagraph_capture_sizes = cudagraph_capture_sizes
+        self.cudagraph_capture_sizes = config.cudagraph_config.capture_sizes
         self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
-        self.triton_distributed_ctx: dict[int, Any] = {}
+        self._gemm_rs_ops: dict[tuple[int, int], flux.GemmRS] = {}
+        self._tp_group: Any = None
+        self._world_size: int = 0
+        self._nnodes: int = 1
 
-    def lazy_initialize_triton_distributed_ctx(
-        self, hidden_dim: int, output_dim: int, dtype: torch.dtype
-    ) -> None:
-        tp_group = get_tp_group()
-        init_nvshmem_by_torch_process_group(tp_group.device_group)
-        world_size = tp_group.world_size
-        world_rank = tp_group.rank_in_group
+    def _get_gemm_rs(
+        self, K: int, N: int, dtype: torch.dtype
+    ) -> flux.GemmRS:
+        key = (N, K)
+        if key in self._gemm_rs_ops:
+            return self._gemm_rs_ops[key]
+        if self._tp_group is None:
+            tp = get_tp_group()
+            self._tp_group = tp.device_group
+            self._world_size = tp.world_size
+            flux.init_flux_shm(self._tp_group)
         MAX_M = 16384
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        NUM_COMM_SMS = 36 if hidden_dim == 2048 else 44
-        NUM_GEMM_SMS = NUM_SMS - NUM_COMM_SMS
-        self.triton_distributed_ctx[output_dim] = create_gemm_ar_context(
-            self.comm_stream,
-            world_rank,
-            world_size,
-            world_size,
+        op = flux.GemmRS(
+            self._tp_group,
+            self._nnodes,
             MAX_M,
-            output_dim,
-            dtype,
-            NUM_COMM_SMS=NUM_COMM_SMS,
+            N,
+            input_dtype=dtype,
+            output_dtype=dtype,
+            transpose_weight=False,
         )
-        BM, BN, BK = 128, 256, 64
-        num_stages = 4
-        num_warps = 8
-        self.gemm_config = triton.Config(
-            {
-                "BLOCK_SIZE_M": BM,
-                "BLOCK_SIZE_N": BN,
-                "BLOCK_SIZE_K": BK,
-                "GROUP_SIZE_M": 1,
-                "NUM_GEMM_SMS": NUM_GEMM_SMS,
-            },
-            num_stages=num_stages,
-            num_warps=num_warps,
-        )
-        nvshmem_barrier_all_on_stream()
+        self._gemm_rs_ops[key] = op
+        return op
 
     def fused_gemm_allreduce(
         self, x: torch.Tensor, size: int, weight: torch.Tensor
     ) -> torch.Tensor:
-        if weight.shape[0] not in self.triton_distributed_ctx:
-            self.lazy_initialize_triton_distributed_ctx(
-                x.shape[-1], weight.shape[0], x.dtype
-            )
-        return gemm_allreduce_op(
-            self.triton_distributed_ctx[weight.shape[0]],
-            x,
-            weight,
-            self.gemm_config,
-            copy_to_local=True,
-            USE_MULTIMEM_ST=True,
+        K, N = x.shape[-1], weight.shape[0]
+        gemm_rs = self._get_gemm_rs(K, N, x.dtype)
+
+        # Fused GEMM + ReduceScatter → [M/TP, N]
+        rs_output = gemm_rs.forward(x, weight)
+
+        # AllGather to reconstruct [M, N]
+        full_output = torch.empty(
+            [x.shape[0], N], dtype=rs_output.dtype, device=rs_output.device
         )
+        torch.distributed.all_gather_into_tensor(
+            full_output, rs_output, group=self._tp_group
+        )
+        return full_output
 
     @override
     def get_split_rules(self) -> list[MatchingRule]:
@@ -132,6 +118,7 @@ class FluxScheduler(OpSchedulerBase):
             split_indices=[0, prefix_sum[-1]],
             is_dryrun=False,
             use_cudagraph=use_cudagraph,
+            allow_fallback=False,
         )
 
     @override

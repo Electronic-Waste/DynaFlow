@@ -20,6 +20,9 @@ strategy_name_to_config = {
     "tokenweave": "{\"scheduler_path\":"
                   f"\"{os.path.join(os.path.dirname(__file__), 'scheduler', 'vllm', 'tokenweave.py')}:TokenWeaveScheduler\","
                   "\"use_inductor\": false, \"min_nano_split_tokens\": 4096, \"max_num_splits\": 2}",
+    "flux": "{\"scheduler_path\":"
+            f"\"{os.path.join(os.path.dirname(__file__), 'scheduler', 'vllm', 'flux.py')}:FluxScheduler\","
+            "\"use_inductor\": false, \"max_num_splits\": 1}",
 }
 
 def run_with_retry(command, result_json, log_path, env=None, max_attempts=5):

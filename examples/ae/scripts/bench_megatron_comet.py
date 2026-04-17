@@ -193,36 +193,57 @@ def setup_distributed(tp_size: int, ep_size: int) -> None:
     rng_tracker.add(get_expert_parallel_rng_tracker_name(), 5678)
 
 
-MODEL_HIDDEN_SIZE = 2048
-MODEL_FFN_HIDDEN_SIZE = 1408
-MODEL_NUM_ATTENTION_HEADS = 16
-MODEL_NUM_LAYERS = 6
-MODEL_NUM_MOE_EXPERTS = 64
-MODEL_MOE_ROUTER_TOPK = 4
-MODEL_VOCAB_SIZE = 152064
-MODEL_MAX_SEQ_LENGTH = 8192
-MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE = 1408
+MODEL_CONFIGS: dict[str, dict] = {
+    # Qwen2-MoE-2.7B with num_layers truncated to 6 for memory fit.
+    "qwen2-6layers": {
+        "num_layers": 6,
+        "hidden_size": 2048,
+        "ffn_hidden_size": 1408,
+        "num_attention_heads": 16,
+        "num_query_groups": 16,  # MHA (no GQA in Qwen2-MoE-2.7B)
+        "add_qkv_bias": True,
+        "num_moe_experts": 64,
+        "moe_router_topk": 4,
+        "vocab_size": 152064,
+        "max_seq_length": 8192,
+        "moe_shared_expert_intermediate_size": 1408,
+    },
+    # Mixtral 8x7B with num_layers truncated to 8.
+    "mixtral-8layers": {
+        "num_layers": 8,
+        "hidden_size": 4096,
+        "ffn_hidden_size": 14336,
+        "num_attention_heads": 32,
+        "num_query_groups": 8,  # GQA
+        "add_qkv_bias": False,
+        "num_moe_experts": 8,
+        "moe_router_topk": 2,
+        "vocab_size": 32000,
+        "max_seq_length": 32768,
+        "moe_shared_expert_intermediate_size": None,  # Mixtral has no shared experts
+    },
+}
 
 
-def create_model(tp_size: int, ep_size: int) -> GPTModel:
+def create_model(model_cfg: dict, tp_size: int, ep_size: int) -> GPTModel:
     config = TransformerConfig(
-        num_layers=MODEL_NUM_LAYERS,
-        hidden_size=MODEL_HIDDEN_SIZE,
-        ffn_hidden_size=MODEL_FFN_HIDDEN_SIZE,
-        num_attention_heads=MODEL_NUM_ATTENTION_HEADS,
-        num_query_groups=MODEL_NUM_ATTENTION_HEADS,  # MHA (no GQA in Qwen2-MoE-2.7B)
+        num_layers=model_cfg["num_layers"],
+        hidden_size=model_cfg["hidden_size"],
+        ffn_hidden_size=model_cfg["ffn_hidden_size"],
+        num_attention_heads=model_cfg["num_attention_heads"],
+        num_query_groups=model_cfg["num_query_groups"],
         layernorm_epsilon=1e-6,
         add_bias_linear=False,
-        add_qkv_bias=True,
+        add_qkv_bias=model_cfg["add_qkv_bias"],
         # MoE / EP config
-        num_moe_experts=MODEL_NUM_MOE_EXPERTS,
+        num_moe_experts=model_cfg["num_moe_experts"],
         expert_model_parallel_size=ep_size,
         moe_token_dispatcher_type="alltoall",
-        moe_router_topk=MODEL_MOE_ROUTER_TOPK,
+        moe_router_topk=model_cfg["moe_router_topk"],
         moe_router_load_balancing_type="none",
         moe_grouped_gemm=False,
         moe_layer_freq=1,
-        moe_shared_expert_intermediate_size=MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE,
+        moe_shared_expert_intermediate_size=model_cfg["moe_shared_expert_intermediate_size"],
     )
 
     layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
@@ -230,8 +251,8 @@ def create_model(tp_size: int, ep_size: int) -> GPTModel:
     model = GPTModel(
         config=config,
         transformer_layer_spec=layer_spec,
-        vocab_size=MODEL_VOCAB_SIZE,
-        max_sequence_length=MODEL_MAX_SEQ_LENGTH,
+        vocab_size=model_cfg["vocab_size"],
+        max_sequence_length=model_cfg["max_seq_length"],
         pre_process=True,
         post_process=True,
         parallel_output=False,
@@ -256,9 +277,10 @@ def create_optimizer(model: GPTModel) -> MegatronOptimizer:
 
 
 def create_dummy_batch(
-    batch_size: int = 32, seq_length: int = 512,
+    vocab_size: int,
+    batch_size: int = 32,
+    seq_length: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    vocab_size = 32768
     tokens = torch.randint(0, vocab_size, (batch_size, seq_length), dtype=torch.long, device='cuda')
     position_ids = (
         torch.arange(seq_length, dtype=torch.long, device='cuda')
@@ -379,6 +401,10 @@ def main() -> None:
         "--mode", choices=["megatron", "dynaflow"], default="dynaflow",
         help="'megatron': eager baseline; 'dynaflow': Comet via DynaFlow.",
     )
+    parser.add_argument(
+        "--config", choices=list(MODEL_CONFIGS.keys()), default="qwen2-6layers",
+        help="Model configuration preset.",
+    )
     parser.add_argument("--task", choices=["inference", "training"], default="inference")
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--trials", type=int, default=10)
@@ -408,13 +434,16 @@ def main() -> None:
 
     setup_distributed(tp_size=args.tp_size, ep_size=args.ep_size)
 
-    model = create_model(tp_size=args.tp_size, ep_size=args.ep_size)
+    model_cfg = MODEL_CONFIGS[args.config]
+    model = create_model(model_cfg, tp_size=args.tp_size, ep_size=args.ep_size)
 
     # Wrap MoELayer.forward as an opaque custom op (both modes).
     # Must be called after model creation so the MoE layer reference is available.
     _patch_moe_as_custom_op(model)
     tokens, position_ids, attention_mask, labels = create_dummy_batch(
-        batch_size=args.batch_size, seq_length=args.seq_len,
+        vocab_size=model_cfg["vocab_size"],
+        batch_size=args.batch_size,
+        seq_length=args.seq_len,
     )
 
     # Compile the model — backend differs by mode.
@@ -425,10 +454,10 @@ def main() -> None:
         split_config = None
     elif args.mode == "dynaflow":
         comet_config = {
-            "num_moe_experts": MODEL_NUM_MOE_EXPERTS,
-            "moe_router_topk": MODEL_MOE_ROUTER_TOPK,
-            "hidden_size": MODEL_HIDDEN_SIZE,
-            "ffn_hidden_size": MODEL_FFN_HIDDEN_SIZE,
+            "num_moe_experts": model_cfg["num_moe_experts"],
+            "moe_router_topk": model_cfg["moe_router_topk"],
+            "hidden_size": model_cfg["hidden_size"],
+            "ffn_hidden_size": model_cfg["ffn_hidden_size"],
             "seq_length": args.seq_len,
             "batch_size": args.batch_size,
         }
