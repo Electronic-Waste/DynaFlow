@@ -196,7 +196,8 @@ class DynaFlowEngine:
             placeholder_idx = self.placeholder_node_to_idx[node]
             example_value = node.meta.get("example_value", None)
             if isinstance(example_value, torch.SymInt):
-                new_args[placeholder_idx] = num_tokens_padded
+                if args[placeholder_idx] == num_tokens_padded:
+                    new_args[placeholder_idx] = num_tokens_padded
             elif (
                 isinstance(example_value, torch.Tensor)
                 and isinstance(example_value.shape[0], torch.SymInt)
@@ -470,13 +471,10 @@ class DynaFlowEngine:
                 else:
                     env.put(batch_idx, node, args[placeholder_idx])
             elif isinstance(example_value, torch.SymInt):
-                if args[placeholder_idx] != total_num_tokens_padded:
-                    raise ValueError(
-                        f"Dynamic input length {args[placeholder_idx]} does not match "
-                        f"expected num_tokens {total_num_tokens_padded} for placeholder {node}"
-                    )
-                assert args[placeholder_idx] == total_num_tokens_padded
-                env.put(batch_idx, node, num_tokens_padded)
+                if args[placeholder_idx] == total_num_tokens_padded:
+                    env.put(batch_idx, node, num_tokens_padded)
+                else:
+                    env.put(batch_idx, node, args[placeholder_idx])
             else:
                 raise ValueError(f"Invalid example value type: {type(example_value)}")
         elif node.op == "call_function":
