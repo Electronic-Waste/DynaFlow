@@ -29,7 +29,7 @@ def create_argument_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=600,
         help="Timeout in seconds",
     )
     parser.add_argument(
@@ -257,9 +257,9 @@ if __name__ == "__main__":
         procs.append(proc)
     exit_code = 0
     for proc in procs:
-        proc.join(timeout=300)
+        proc.join(timeout=args.timeout)
         if proc.exitcode is None:
-            print(f"Killing process {proc.pid} that didn't stop within 2 minutes.")
+            print(f"Killing process {proc.pid} that didn't stop within {args.timeout} seconds.")
             proc.kill()
             exit_code = 1
         elif proc.exitcode:

@@ -37,11 +37,12 @@ class NanoFlowScheduler(OpSchedulerBase):
         self.use_ar_norm_fusion = nanoflow_config["use_ar_norm_fusion"]
         self.cudagraph_capture_sizes = \
             config.cudagraph_config.capture_sizes
-        self.comm_stream: torch.cuda.Stream = (
-            green_ctx.split_device_green_ctx_by_sm_count(
-                dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
-            )[0][0]
-        )  # type: ignore
+        # self.comm_stream: torch.cuda.Stream = (
+        #     green_ctx.split_device_green_ctx_by_sm_count(
+        #         dev=torch.device(f"cuda:{torch.cuda.current_device()}"), sm_counts=[48]
+        #     )[0][0]
+        # )  # type: ignore
+        self.comm_stream = torch.cuda.Stream()
         self.comp_stream = torch.cuda.Stream()
         self.ipc_handles: list[list[int]] | None = None
         self.workspace_tensor: torch.Tensor | None = None

@@ -14,6 +14,19 @@ strategy_name_to_config = {
 }
 
 
+def run_with_retry(command, result_json, log_path, env=None, max_attempts=5):
+    for attempt in range(max_attempts):
+        if os.path.exists(result_json):
+            os.remove(result_json)
+        with open(log_path, "w") as f:
+            print(f"Running command (attempt {attempt + 1}): {' '.join(command)}")
+            result = subprocess.run(command, env=env, stdout=f, stderr=subprocess.STDOUT)
+        if result.returncode == 0:
+            return
+        print(f"Attempt {attempt + 1} failed (exit code {result.returncode})")
+    raise RuntimeError(f"Command failed after {max_attempts} attempts: {' '.join(command)}")
+
+
 def create_parser():
     parser = argparse.ArgumentParser(description="EP Benchmark")
     parser.add_argument(
@@ -75,39 +88,81 @@ def main():
                     f"{model_short_name}_dp_{dp_size}_"
                     f"input{input_len}_output{output_len}_iter{i}"
                 )
-                with open(f"{dirname}/log/{testcase_name}.log", "w") as f:
-                    command = [
-                        "python",
-                        "../scripts/bench_vllm_dp.py",
-                        "--model",
-                        model_name,
-                        "--dp-size",
-                        str(dp_size),
-                        "--num-prompts",
-                        "1024",
-                        "--input-len",
-                        str(input_len),
-                        "--output-len",
-                        str(output_len),
-                        "--gpu-memory-utilization",
-                        "0.9",
-                        "--max-num-seqs",
-                        "4096",
-                        "--compilation-config",
-                        '{"cudagraph_mode": "NONE"}',
-                        "--output-json",
-                        f"{dirname}/{testcase_name}.json",
-                        "--enable-expert-parallel",
-                    ]
-                    
-                    if strategy == "dbo":
-                        command += ["--dynaflow-config", f"{strategy_name_to_config[strategy]}"]
-                    elif strategy == "original_dbo":
-                        command += ["--enable-dbo"]
-                    print(f"Running command: {' '.join(command)}")
-                    subprocess.run(
-                        command, env=env, check=True, stdout=f, stderr=subprocess.STDOUT
-                    )
+                result_json = f"{dirname}/{testcase_name}.json"
+                command = [
+                    "python",
+                    "../scripts/bench_vllm_dp.py",
+                    "--model",
+                    model_name,
+                    "--dp-size",
+                    str(dp_size),
+                    "--num-prompts",
+                    "1024",
+                    "--input-len",
+                    str(input_len),
+                    "--output-len",
+                    str(output_len),
+                    "--gpu-memory-utilization",
+                    "0.9",
+                    "--max-num-seqs",
+                    "4096",
+                    "--compilation-config",
+                    '{"cudagraph_mode": "NONE"}',
+                    "--output-json",
+                    result_json,
+                    "--enable-expert-parallel",
+                ]
+                if strategy == "dbo":
+                    command += ["--dynaflow-config", strategy_name_to_config[strategy]]
+                elif strategy == "original_dbo":
+                    command += ["--enable-dbo"]
+                run_with_retry(
+                    command=command,
+                    result_json=result_json,
+                    log_path=f"{dirname}/log/{testcase_name}.log",
+                    env=env,
+                    max_attempts=1, # There is no need to retry for DBO
+                )
+
+
+    elif mode == "dataset":
+        basedir = os.path.expanduser("~/.cache/dynaflow/eval_datasets")
+        dataset_paths = {
+            "sharegpt":  os.path.join(basedir, "sharegpt.json"),
+            "lmsys":     os.path.join(basedir, "lmsys.json"),
+            "splitwise": os.path.join(basedir, "splitwise.json"),
+        }
+        for dataset_label, dataset_path in dataset_paths.items():
+            for i in range(5):
+                testcase_name = (
+                    f"{model_short_name}_dp_{dp_size}_{dataset_label}_iter{i}"
+                )
+                result_json = f"{dirname}/{testcase_name}.json"
+                command = [
+                    "python",
+                    "../scripts/bench_vllm_dp.py",
+                    "--model", model_name,
+                    "--dp-size", str(dp_size),
+                    "--dataset-name", "sharegpt",
+                    "--dataset-path", dataset_path,
+                    "--num-prompts", "4096",
+                    "--gpu-memory-utilization", "0.9",
+                    "--max-num-seqs", "4096",
+                    "--compilation-config", '{"cudagraph_mode": "NONE"}',
+                    "--output-json", result_json,
+                    "--enable-expert-parallel",
+                ]
+                if strategy == "dbo":
+                    command += ["--dynaflow-config", strategy_name_to_config[strategy]]
+                elif strategy == "original_dbo":
+                    command += ["--enable-dbo"]
+                run_with_retry(
+                    command=command,
+                    result_json=result_json,
+                    log_path=f"{dirname}/log/{testcase_name}.log",
+                    env=env,
+                    max_attempts=1, # There is no need to retry for DBO
+                )
 
 
 if __name__ == "__main__":

@@ -129,6 +129,68 @@ index df6564077..139ce550b 100644
          if not self.instance_id:
              self.instance_id = random_uuid()[:5]
  
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+index ae18429f6..55a697e29 100644
+--- a/vllm/distributed/device_communicators/all2all.py
++++ b/vllm/distributed/device_communicators/all2all.py
+@@ -10,6 +10,8 @@ from vllm.distributed import get_dp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.utils import has_deep_ep, has_pplx
++from vllm.v1.worker.ubatching import (dbo_switch_to_compute_sync,
++                                      dbo_yield_and_switch_from_compute_to_comm)
+ 
+ from .base_device_communicator import All2AllManagerBase, Cache
+ 
+@@ -50,10 +52,12 @@ class NaiveAll2AllManager(All2AllManagerBase):
+         cu_tokens_across_dp_cpu = get_forward_context(
+         ).dp_metadata.cu_tokens_across_dp_cpu
+ 
++        dbo_yield_and_switch_from_compute_to_comm()
+         hidden_states = self.naive_multicast(hidden_states,
+                                              cu_tokens_across_dp_cpu)
+         router_logits = self.naive_multicast(router_logits,
+                                              cu_tokens_across_dp_cpu)
++        dbo_switch_to_compute_sync()
+         return hidden_states, router_logits
+ 
+     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+@@ -63,7 +67,9 @@ class NaiveAll2AllManager(All2AllManagerBase):
+             self.dp_rank - 1]
+         end = cu_tokens_across_dp_cpu[self.dp_rank]
+ 
++        dbo_yield_and_switch_from_compute_to_comm()
+         all_hidden_states = self.dp_group.all_reduce(hidden_states)
++        dbo_switch_to_compute_sync()
+         hidden_states = all_hidden_states[start:end, :]
+         return hidden_states
+ 
+@@ -87,11 +93,13 @@ class AgRsAll2AllManager(All2AllManagerBase):
+         """
+         sizes = get_forward_context(
+         ).dp_metadata.get_chunk_sizes_across_dp_rank()
++        dbo_yield_and_switch_from_compute_to_comm()
+         hidden_states, router_logits = get_dp_group().all_gatherv(
+             [hidden_states, router_logits],
+             dim=0,
+             sizes=sizes,
+         )
++        dbo_switch_to_compute_sync()
+         return hidden_states, router_logits
+ 
+     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+@@ -100,9 +108,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
+         """
+         sizes = get_forward_context(
+         ).dp_metadata.get_chunk_sizes_across_dp_rank()
++        dbo_yield_and_switch_from_compute_to_comm()
+         hidden_states = get_dp_group().reduce_scatterv(hidden_states,
+                                                        dim=0,
+                                                        sizes=sizes)
++        dbo_switch_to_compute_sync()
+         return hidden_states
+ 
+     def destroy(self):
 diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
 index 3f0dfce1b..9a1bc140c 100644
 --- a/vllm/engine/arg_utils.py

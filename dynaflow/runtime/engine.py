@@ -470,6 +470,11 @@ class DynaFlowEngine:
                 else:
                     env.put(batch_idx, node, args[placeholder_idx])
             elif isinstance(example_value, torch.SymInt):
+                if args[placeholder_idx] != total_num_tokens_padded:
+                    raise ValueError(
+                        f"Dynamic input length {args[placeholder_idx]} does not match "
+                        f"expected num_tokens {total_num_tokens_padded} for placeholder {node}"
+                    )
                 assert args[placeholder_idx] == total_num_tokens_padded
                 env.put(batch_idx, node, num_tokens_padded)
             else:

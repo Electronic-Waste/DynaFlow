@@ -62,7 +62,9 @@ class NanoFlowScheduler(OpSchedulerBase):
             prefix_sum[mid] < self.min_nano_split_tokens
             or (prefix_sum[-1] - prefix_sum[mid]) < self.min_nano_split_tokens
         ):
-            num_tokens_padded = prefix_sum[-1]
+            # Even if we don't use cudagraph,
+            # we still want to pad the input to at least 2 tokens to avoid recompile
+            num_tokens_padded = max(prefix_sum[-1], 2)
             if use_cudagraph:
                 num_tokens_padded, use_cudagraph = pack_tokens(
                     prefix_sum[-1], self.cudagraph_capture_sizes

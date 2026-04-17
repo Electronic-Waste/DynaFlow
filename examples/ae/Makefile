@@ -25,7 +25,6 @@ vllm-original: vllm/.venv/bin/activate
 	for run in $(VLLM_TP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    tp=$$(echo $$run | cut -d: -f2); \
-			python ../vllm-bench-tp.py --model $$model --tp-size $$tp --mode fixed; \
 	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --mode dataset; \
 	done
 
@@ -38,12 +37,20 @@ vllm-nanoflow: vllm/.venv/bin/activate
 	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --strategy nanoflow --mode dataset; \
 	done
 
+vllm-nanoflow-old: vllm/.venv/bin/activate
+	cd vllm && source .venv/bin/activate && \
+	for run in $(VLLM_TP_RUNS); do \
+	    model=$$(echo $$run | cut -d: -f1); \
+	    tp=$$(echo $$run | cut -d: -f2); \
+	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --strategy nanoflow_old --mode fixed; \
+	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --strategy nanoflow_old --mode dataset; \
+	done
+
 vllm-tokenweave: vllm/.venv/bin/activate
 	cd vllm && source .venv/bin/activate && \
 	for run in $(VLLM_TP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    tp=$$(echo $$run | cut -d: -f2); \
-	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --strategy tokenweave --mode fixed; \
 	    python ../vllm-bench-tp.py --model $$model --tp-size $$tp --strategy tokenweave --mode dataset; \
 	done
 
@@ -52,7 +59,7 @@ vllm-ep: vllm/.venv/bin/activate
 	for run in $(VLLM_EP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    dp=$$(echo $$run | cut -d: -f2); \
-	    python ../vllm-bench-ep.py --model $$model --dp-size $$dp --mode fixed; \
+	    python ../vllm-bench-ep.py --model $$model --dp-size $$dp --mode dataset; \
 	done
 
 vllm-original-dbo: vllm/.venv/bin/activate
@@ -61,6 +68,7 @@ vllm-original-dbo: vllm/.venv/bin/activate
 	    model=$$(echo $$run | cut -d: -f1); \
 	    dp=$$(echo $$run | cut -d: -f2); \
 	    python ../vllm-bench-ep.py --model $$model --dp-size $$dp --strategy original_dbo --mode fixed; \
+	    python ../vllm-bench-ep.py --model $$model --dp-size $$dp --strategy original_dbo --mode dataset; \
 	done
 
 vllm-dbo: vllm/.venv/bin/activate
@@ -68,7 +76,7 @@ vllm-dbo: vllm/.venv/bin/activate
 	for run in $(VLLM_EP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    dp=$$(echo $$run | cut -d: -f2); \
-	    python ../vllm-bench-ep.py --model $$model --dp-size $$dp --strategy dbo --mode fixed; \
+	    CUDA_VISIBLE_DEVICES=2,3 python ../vllm-bench-ep.py --model $$model --dp-size $$dp --strategy dbo --mode dataset; \
 	done
 
 # ── SGLang ────────────────────────────────────────────────────────────────────
@@ -77,8 +85,15 @@ sglang-original: sglang/.venv/bin/activate
 	for run in $(SGLANG_TP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    tp=$$(echo $$run | cut -d: -f2); \
-	    python ../sglang-bench-tp.py --model $$model --tp-size $$tp --mode fixed; \
 	    python ../sglang-bench-tp.py --model $$model --tp-size $$tp --mode dataset; \
+	done
+
+sglang-all-split: sglang/.venv/bin/activate
+	cd sglang && source .venv/bin/activate && \
+	for run in $(SGLANG_TP_RUNS); do \
+	    model=$$(echo $$run | cut -d: -f1); \
+	    tp=$$(echo $$run | cut -d: -f2); \
+	    python ../sglang-bench-tp.py --model $$model --tp-size $$tp --strategy all_split --mode dataset; \
 	done
 
 sglang-nanoflow: sglang/.venv/bin/activate
@@ -86,6 +101,5 @@ sglang-nanoflow: sglang/.venv/bin/activate
 	for run in $(SGLANG_TP_RUNS); do \
 	    model=$$(echo $$run | cut -d: -f1); \
 	    tp=$$(echo $$run | cut -d: -f2); \
-	    python ../sglang-bench-tp.py --model $$model --tp-size $$tp --strategy nanoflow --mode fixed; \
 			python ../sglang-bench-tp.py --model $$model --tp-size $$tp --strategy nanoflow --mode dataset; \
 	done
