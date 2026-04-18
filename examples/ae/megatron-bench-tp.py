@@ -5,7 +5,7 @@ import subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TORCHRUN = os.path.join(SCRIPT_DIR, "Megatron-LM", ".venv", "bin", "torchrun")
-BENCH_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "bench_megatron.py")
+BENCH_SCRIPT = os.path.join(SCRIPT_DIR, "scripts", "bench_megatron_tp.py")
 
 model_name_to_short_name = {
     "gpt-small": "gpt_small",
