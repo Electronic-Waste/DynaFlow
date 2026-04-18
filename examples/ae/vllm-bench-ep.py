@@ -4,13 +4,18 @@ import argparse
 
 model_name_to_short_name = {
     "deepseek-ai/DeepSeek-V2-Lite": "deepseek_v2_lite",
+    "Qwen/Qwen2-57B-A14B-Instruct": "qwen2_57b",
+    "deepseek-ai/DeepSeek-V3": "deepseek_v3",
 }
 
 strategy_name_to_config = {
     "dbo": '{"scheduler_path": "../scheduler/vllm/dbo.py:DBOScheduler",'
-    '"use_inductor": true, "min_nano_split_tokens": 2048,'
+    '"use_inductor": true, "min_nano_split_tokens": 1000000,'
     '"max_num_splits": 2}',
     'original_dbo': '',
+    "none": '{"scheduler_path": "../scheduler/vllm/dbo.py:DBOScheduler",'
+    '"use_inductor": false, "min_nano_split_tokens": 1000000,'
+    '"max_num_splits": 2}'
 }
 
 
@@ -51,6 +56,12 @@ def create_parser():
         required=True,
         help="Benchmark mode",
     )
+    parser.add_argument(
+        "--no-nvlink",
+        action="store_true",
+        help="Disable NVLink and force NCCL to use PCIe (NCCL_P2P_DISABLE=1). "
+        "Results are written to a separate '_pcie' testsuite directory.",
+    )
     return parser
 
 
@@ -63,6 +74,8 @@ def main():
     dp_size = int(args.dp_size)
     mode = str(args.mode)
     strategy = str(args.strategy) if args.strategy else "none"
+    if args.no_nvlink:
+        model_short_name = f"{model_short_name}_pcie"
     testsuite_name = (
         f"vllm_ep_{strategy}/{model_short_name}"
         if strategy != "none"
@@ -73,7 +86,14 @@ def main():
 
     env = os.environ.copy()
     env["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-    env["VLLM_ATTENTION_BACKEND"] = "CUTLASS_MLA"
+    if model_short_name.startswith("deepseek"):
+        env["VLLM_ATTENTION_BACKEND"] = "CUTLASS_MLA"
+    else:
+        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+    if args.no_nvlink:
+        env["NCCL_P2P_DISABLE"] = "1"
+
+    gpu_mem_util = "0.8" if model_short_name.startswith("deepseek_v3") else "0.9"
 
     if mode == "fixed":
         input_output_lengths = [
@@ -83,7 +103,7 @@ def main():
         ]
 
         for input_len, output_len in input_output_lengths:
-            for i in range(10):
+            for i in range(3):
                 testcase_name = (
                     f"{model_short_name}_dp_{dp_size}_"
                     f"input{input_len}_output{output_len}_iter{i}"
@@ -103,19 +123,21 @@ def main():
                     "--output-len",
                     str(output_len),
                     "--gpu-memory-utilization",
-                    "0.9",
+                    gpu_mem_util,
                     "--max-num-seqs",
                     "4096",
                     "--compilation-config",
                     '{"cudagraph_mode": "NONE"}',
+                    "--load-format",
+                    "dummy",
                     "--output-json",
                     result_json,
                     "--enable-expert-parallel",
                 ]
-                if strategy == "dbo":
+                if strategy == "original_dbo":
+                    command += ["--enable-dbo", "--dbo-decode-token-threshold=2048"]
+                else:
                     command += ["--dynaflow-config", strategy_name_to_config[strategy]]
-                elif strategy == "original_dbo":
-                    command += ["--enable-dbo"]
                 run_with_retry(
                     command=command,
                     result_json=result_json,
@@ -133,7 +155,7 @@ def main():
             "splitwise": os.path.join(basedir, "splitwise.json"),
         }
         for dataset_label, dataset_path in dataset_paths.items():
-            for i in range(5):
+            for i in range(2):
                 testcase_name = (
                     f"{model_short_name}_dp_{dp_size}_{dataset_label}_iter{i}"
                 )
@@ -145,17 +167,18 @@ def main():
                     "--dp-size", str(dp_size),
                     "--dataset-name", "sharegpt",
                     "--dataset-path", dataset_path,
-                    "--num-prompts", "4096",
-                    "--gpu-memory-utilization", "0.9",
+                    "--num-prompts", f"{2048 * (i + 2)}",
+                    "--gpu-memory-utilization", gpu_mem_util,
                     "--max-num-seqs", "4096",
                     "--compilation-config", '{"cudagraph_mode": "NONE"}',
+                    "--load-format", "dummy",
                     "--output-json", result_json,
                     "--enable-expert-parallel",
                 ]
-                if strategy == "dbo":
+                if strategy == "original_dbo":
+                    command += ["--enable-dbo", "--dbo-decode-token-threshold=2048"]
+                else:
                     command += ["--dynaflow-config", strategy_name_to_config[strategy]]
-                elif strategy == "original_dbo":
-                    command += ["--enable-dbo"]
                 run_with_retry(
                     command=command,
                     result_json=result_json,
