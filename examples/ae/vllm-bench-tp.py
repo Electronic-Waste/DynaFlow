@@ -4,6 +4,7 @@ import argparse
 
 model_name_to_short_name = {
     "meta-llama/Meta-Llama-3-8B-Instruct": "llama3_8b",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": "llama3.1_8b",
     "meta-llama/Meta-Llama-3-70B-Instruct": "llama3_70b",
     "Qwen/Qwen2.5-72B-Instruct": "qwen2.5_72b",
 }
