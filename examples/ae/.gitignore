@@ -1,3 +1,4 @@
+/bin/
 /results/
 /vllm/
 /sglang/
@@ -6,3 +7,7 @@
 /flux/
 /Megatron-LM/
 /Megatron-Comet/
+
+# compiled kernel-overlap PoC binaries (rebuild from the .cu sources)
+/up_silu
+/up_silu_*
